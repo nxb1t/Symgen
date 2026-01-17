@@ -12,7 +12,7 @@ Traditionally, creating Volatility3 Linux symbols means spinning up a Linux VM, 
 
 This project fully automates that process. Given a target kernel, it uses Docker to fetch the correct debug symbols, generate Volatility3 compatible JSON symbol files, and make them available through a simple web interface, saving time and eliminating manual setup.
 
-There is an awesome collection of volatility symbols by [Abyss-W4tcher](https://github.com/Abyss-W4tcher/volatility3-symbols/tree/master) which contains most of the common kernels, however there could be still edge cases where the symbols are not present in the collection, so during those times this project can be used.
+There is an excellent collection of Volatility symbols by [Abyss-W4tcher](https://github.com/Abyss-W4tcher/volatility3-symbols) that contains most common kernels. However, there may still be edge cases where symbols are not present in the collection, in such situations this project can be used.
 
 ## Features
 
