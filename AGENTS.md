@@ -1,161 +1,164 @@
 # Symgen - Agent Guidelines
 
-Guidelines for AI coding agents working on this Volatility3 Linux Symbol Generator.
+Guidelines for AI agents working on this Volatility3 Linux Symbol Generator.
 
 ## Project Structure
 
 ```
+/cli               # Rust CLI (clap + tokio + bollard)
 /frontend          # Next.js 16 + React 19 + TypeScript
 /backend           # FastAPI + SQLAlchemy + Docker SDK
-/docker-compose.yml
 ```
 
-## Commands
+## Build & Run Commands
+
+### CLI (`/cli/`)
+
+```bash
+cargo build --release          # Build release binary (cli/target/release/symgen)
+cargo build                    # Debug build
+cargo run -- generate --help   # Run with args
+cargo fmt                      # Format code
+cargo clippy                   # Lint
+```
 
 ### Frontend (`/frontend/`)
 
 ```bash
-npm install          # Install dependencies
-npm run dev          # Dev server with Turbopack (http://localhost:3000)
-npm run build        # Production build (RUN AFTER CHANGES)
-npm run lint         # Check for lint errors
-npm run lint:fix     # Auto-fix lint errors
+npm install                    # Install dependencies
+npm run dev                    # Dev server (http://localhost:3000)
+npm run build                  # Production build - RUN AFTER CHANGES
+npm run lint                   # ESLint check
+npm run lint:fix               # Auto-fix lint errors
 ```
 
 ### Backend (`/backend/`)
 
 ```bash
-python -m venv venv && source venv/bin/activate  # Create/activate venv
-pip install -r requirements.txt                   # Install dependencies
-uvicorn app.main:app --reload --port 8000        # Dev server
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
 ```
 
 ### Docker
 
 ```bash
-docker-compose up -d      # Start all services
-docker-compose down       # Stop all services
-docker-compose logs -f    # View logs
+docker-compose up -d           # Start all services
+docker-compose down            # Stop services
+docker-compose logs -f         # View logs
 ```
+
+**Note**: No test framework configured. Add pytest/vitest if needed.
 
 ## Code Style
 
-### TypeScript/React
+### Rust (CLI)
 
-**Strict TypeScript**: `strict: true` and `noUncheckedIndexedAccess: true` are enabled.
+**Imports** (grouped with blank lines):
+```rust
+use std::path::PathBuf;                    // 1. std library
 
-**Import Order**:
-```tsx
-"use client";                              // 1. Directive (if needed)
-import { useState } from "react";          // 2. React/Next.js
-import { motion } from "motion/react";     // 3. Third-party
-import { Button } from "@/components/ui/button";  // 4. Internal
-import { cn } from "@/lib/utils";          // 5. Utilities
+use anyhow::{Context, Result};             // 2. External crates
+use clap::Parser;
+
+use crate::docker::DockerClient;           // 3. Local modules
 ```
 
-**Components**:
-- Page components: `export default function PageName()`
-- Helper components: arrow functions
-- Set `displayName` for `forwardRef` components
+**Error Handling**: Use `anyhow::Result` for functions, `?` operator for propagation.
 
-**Styling**:
-- Use Tailwind CSS utilities
-- Use `cn()` for conditional classes: `cn("base", condition && "active")`
-- Mobile-first: `sm:`, `md:`, `lg:` prefixes
+**Naming**: `snake_case` for functions/variables, `PascalCase` for types/structs.
 
-**Animations** (motion/react):
+### TypeScript/React (Frontend)
+
+**Imports** (grouped with blank lines):
 ```tsx
-const fadeIn = { hidden: { opacity: 0 }, visible: { opacity: 1 } };
-<motion.div variants={fadeIn} initial="hidden" animate="visible" />
+"use client";                                      // 1. Directive
+
+import { useState, useCallback } from "react";     // 2. React/Next.js
+import { toast } from "sonner";                    // 3. Third-party
+import { Button } from "@/components/ui/button";   // 4. Internal components
+import { cn } from "@/lib/utils";                  // 5. Utilities
+import { symgenApi } from "@/lib/api";             // 6. API/types
 ```
 
-### Python/FastAPI
+**Components**: Use `@/` path alias. Set `displayName` for `forwardRef` components.
 
-**Import Order**:
+**Styling**: Tailwind CSS only, use `cn()` for conditional classes.
+
+**Animations**: Import from `motion/react` (NOT framer-motion).
+
+### Python/FastAPI (Backend)
+
+**Imports** (grouped with blank lines):
 ```python
-import os                          # 1. Standard library
-from fastapi import HTTPException  # 2. Third-party
-from app.models import Job         # 3. Local modules
+import os                              # 1. Standard library
+from typing import Optional
+
+from fastapi import APIRouter          # 2. Third-party
+from sqlalchemy.orm import Session
+
+from app.models import Job             # 3. Local modules
 ```
 
-**Type Hints**: Always use for function parameters and return values.
+**Type Hints**: Required for all function parameters and return values.
 
-**Schemas**: Define in `app/schemas.py` using Pydantic models.
-
-**Routes**: Use `async def` for I/O operations.
+**Async**: Use `async def` for route handlers with I/O operations.
 
 ## Naming Conventions
 
-| Type | TypeScript | Python |
-|------|------------|--------|
-| Components/Classes | `PascalCase` | `PascalCase` |
-| Functions/Methods | `camelCase` | `snake_case` |
-| Variables | `camelCase` | `snake_case` |
-| Constants | `UPPER_SNAKE` | `UPPER_SNAKE` |
-| Files | `kebab-case.tsx` | `snake_case.py` |
+| Type | Rust | TypeScript | Python |
+|------|------|------------|--------|
+| Types/Classes | `PascalCase` | `PascalCase` | `PascalCase` |
+| Functions | `snake_case` | `camelCase` | `snake_case` |
+| Variables | `snake_case` | `camelCase` | `snake_case` |
+| Constants | `UPPER_SNAKE` | `UPPER_SNAKE` | `UPPER_SNAKE` |
+| Files | `snake_case.rs` | `kebab-case.tsx` | `snake_case.py` |
 
 ## Error Handling
 
-**Frontend**:
-```tsx
-try {
-  const data = await symgenApi.generate(...);
-  toast.success("Started");
-} catch (err) {
-  const error = err as { response?: { data?: { detail?: string } } };
-  toast.error(error.response?.data?.detail || "Error");
-}
-```
+**Rust**: `anyhow::bail!("message")` or `return Err(anyhow::anyhow!("message"))`
 
-**Backend**:
-```python
-from fastapi import HTTPException
-raise HTTPException(status_code=400, detail="Invalid kernel version")
-```
+**TypeScript**: Catch axios errors, extract `error.response?.data?.detail`
+
+**Python**: `raise HTTPException(status_code=400, detail="message")`
 
 ## Key Files
 
+### CLI
+- `src/main.rs` - Entry point, command handling
+- `src/cli.rs` - Clap argument definitions
+- `src/generator.rs` - Symbol generation logic
+- `src/banner.rs` - Kernel banner parsing
+- `src/docker.rs` - Docker client (bollard)
+
 ### Frontend
 - `app/page.tsx` - Landing page
-- `app/generator/page.tsx` - Main generator UI
-- `components/navbar.tsx` - Shared navbar
-- `components/ui/` - UI components (button, card, badge, animated-beam)
+- `app/generator/page.tsx` - Generator UI
+- `components/ui/` - Reusable components
 - `lib/api.ts` - API client with types
-- `lib/websocket.ts` - WebSocket client
+- `lib/utils.ts` - Utility functions (`cn()`)
 
 ### Backend
 - `app/main.py` - FastAPI entry point
-- `app/routers/symgen.py` - API endpoints
-- `app/services/symgen.py` - Symbol generation logic
+- `app/routers/symgen.py` - Route handlers
+- `app/services/symgen.py` - Business logic
 - `app/models.py` - SQLAlchemy models
 - `app/schemas.py` - Pydantic schemas
 
-## API Endpoints
+## Important Rules
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/symgen/status` | Docker availability |
-| GET | `/api/symgen/metrics` | System metrics |
-| POST | `/api/symgen/generate` | Start generation |
-| POST | `/api/symgen/parse-banner` | Parse kernel banner |
-| GET | `/api/symgen/jobs` | List jobs |
-| GET | `/api/symgen/jobs/{id}` | Job details |
-| DELETE | `/api/symgen/jobs/{id}` | Delete job |
-| GET | `/api/symgen/download/{id}` | Download symbol |
-| WS | `/api/symgen/ws` | Real-time updates |
-
-## Important Notes
-
-1. **Always run `npm run build`** after frontend changes to verify TypeScript compiles
-2. **Use existing UI components** from `/frontend/components/ui/`
-3. **Docker volume**: `symgen_storage` must be accessible to spawned containers
-4. **Animations**: Import from `motion/react`, not `framer-motion`
-5. **Icons**: Use `lucide-react` for all icons
+1. **Run `npm run build`** after frontend changes to verify TypeScript compiles
+2. **Run `cargo build`** after CLI changes to verify Rust compiles
+3. **Use existing UI components** from `components/ui/` - don't duplicate
+4. **Keep types in sync**: `lib/api.ts` ↔ `app/schemas.py`
+5. **Icons**: Use `lucide-react` only
 6. **Toasts**: Use `sonner` for notifications
-7. **API types**: Keep `lib/api.ts` types in sync with backend schemas
+7. **Docker**: CLI uses `bollard` crate, backend uses `docker` Python SDK
 
 ## Dependencies
 
-**Frontend**: next@16, react@19, motion@12, tailwindcss@3, lucide-react, sonner, axios
+**CLI**: clap, tokio, bollard, anyhow, serde, colored, indicatif, regex
 
-**Backend**: fastapi, uvicorn, sqlalchemy, docker, pydantic@2, psycopg2-binary
+**Frontend**: next@16, react@19, motion@12, tailwindcss, lucide-react, sonner, axios
+
+**Backend**: fastapi, uvicorn, sqlalchemy, docker, pydantic@2

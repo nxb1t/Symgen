@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { toast, Toaster } from "sonner";
 import { cn } from "@/lib/utils";
 import {
@@ -10,10 +10,23 @@ import {
   LinuxDistro,
   UbuntuVersion,
   DebianVersion,
+  FedoraVersion,
+  CentOSVersion,
+  RHELVersion,
+  OracleVersion,
+  RockyVersion,
+  AlmaVersion,
   UbuntuVersionOption,
   DebianVersionOption,
+  FedoraVersionOption,
+  CentOSVersionOption,
+  RHELVersionOption,
+  OracleVersionOption,
+  RockyVersionOption,
+  AlmaVersionOption,
   DistroOption,
   MetricsResponse,
+  QueueStatus,
 } from "@/lib/api";
 import { useWebSocket, WebSocketMessage } from "@/lib/websocket";
 import { Button } from "@/components/ui/button";
@@ -36,6 +49,7 @@ import {
   Search,
   HardDrive,
   Timer,
+  ListOrdered,
 } from "lucide-react";
 
 const PAGE_SIZE = 10;
@@ -53,14 +67,24 @@ export default function SymGenPage() {
   const [jobsTotalPages, setJobsTotalPages] = useState(1);
   const [jobsTotal, setJobsTotal] = useState(0);
   const [searchQuery, setSearchQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "in_progress" | "completed" | "failed">("all");
   
   // Distros and versions
   const [distros, setDistros] = useState<DistroOption[]>([]);
   const [ubuntuVersions, setUbuntuVersions] = useState<UbuntuVersionOption[]>([]);
   const [debianVersions, setDebianVersions] = useState<DebianVersionOption[]>([]);
+  const [fedoraVersions, setFedoraVersions] = useState<FedoraVersionOption[]>([]);
+  const [centosVersions, setCentosVersions] = useState<CentOSVersionOption[]>([]);
+  const [rhelVersions, setRhelVersions] = useState<RHELVersionOption[]>([]);
+  const [oracleVersions, setOracleVersions] = useState<OracleVersionOption[]>([]);
+  const [rockyVersions, setRockyVersions] = useState<RockyVersionOption[]>([]);
+  const [almaVersions, setAlmaVersions] = useState<AlmaVersionOption[]>([]);
   
   // Metrics
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
+  
+  // Queue status
+  const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   
   // Dialogs
   const [generateDialogOpen, setGenerateDialogOpen] = useState(false);
@@ -79,22 +103,28 @@ export default function SymGenPage() {
     setJobsTotal(prev => prev + 1);
   }, []);
   
+  // Ref to fetchMetrics for use in WebSocket handler without causing re-renders
+  const fetchMetricsRef = useRef<(() => Promise<void>) | null>(null);
+
   // WebSocket message handler
   const handleWebSocketMessage = useCallback((message: WebSocketMessage) => {
     if (message.type === "job_update" && message.job) {
       const updatedJob = message.job as SymGenJob;
       console.log(`[SymGen WS] Received job update:`, updatedJob.id, updatedJob.status);
       setJobs(prev => {
-        const index = prev.findIndex(j => j.id === updatedJob.id);
-        if (index >= 0) {
-          const newJobs = prev.map((job, i) => 
-            i === index ? { ...updatedJob } : job
-          );
+        // Use Map for O(1) lookup instead of findIndex O(n)
+        const jobMap = new Map(prev.map((job, i) => [job.id, i]));
+        const index = jobMap.get(updatedJob.id);
+        if (index !== undefined) {
+          const newJobs = [...prev];
+          newJobs[index] = { ...updatedJob };
           return newJobs;
-        } else {
-          return [{ ...updatedJob }, ...prev];
         }
+        return [{ ...updatedJob }, ...prev];
       });
+      
+      // Refresh metrics on every job update to keep queue stats current
+      fetchMetricsRef.current?.();
       
       // Show toast on completion/failure
       if (updatedJob.status === "completed") {
@@ -121,12 +151,24 @@ export default function SymGenPage() {
     setMounted(true);
   }, []);
 
+  // Use refs to track current filter and page for polling (avoids stale closure)
+  const statusFilterRef = useRef(statusFilter);
+  const jobsPageRef = useRef(jobsPage);
+  
+  useEffect(() => {
+    statusFilterRef.current = statusFilter;
+  }, [statusFilter]);
+  
+  useEffect(() => {
+    jobsPageRef.current = jobsPage;
+  }, [jobsPage]);
+
   useEffect(() => {
     fetchInitialData();
     
     // Poll for job updates every 3 seconds
     const jobsInterval = setInterval(() => {
-      fetchJobs(false);
+      fetchJobs(false, statusFilterRef.current, jobsPageRef.current);
     }, 3000);
     
     // Poll for metrics every 10 seconds
@@ -143,10 +185,22 @@ export default function SymGenPage() {
 
   useEffect(() => {
     if (!isLoading) {
-      fetchJobs(false);
+      // When page changes, do a full fetch (not merge) to get the new page's data
+      // Use statusFilterRef to get current filter value
+      fetchJobs(true, statusFilterRef.current, jobsPage);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobsPage]);
+
+  useEffect(() => {
+    if (!isLoading) {
+      // When status filter changes, reset to page 1 and fetch with the new filter
+      setJobsPage(1);
+      // Pass page 1 explicitly since setJobsPage is async
+      fetchJobs(true, statusFilter, 1);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusFilter]);
 
   const fetchInitialData = async () => {
     try {
@@ -156,15 +210,24 @@ export default function SymGenPage() {
       const status = await symgenApi.getStatus();
       setDockerAvailable(status.available);
       setDockerMessage(status.message);
+      if (status.queue) {
+        setQueueStatus(status.queue);
+      }
       
       // Get supported distros and versions
       const distrosData = await symgenApi.getDistros();
       setDistros(distrosData.distros);
       setUbuntuVersions(distrosData.ubuntu_versions);
       setDebianVersions(distrosData.debian_versions);
+      setFedoraVersions(distrosData.fedora_versions);
+      setCentosVersions(distrosData.centos_versions);
+      setRhelVersions(distrosData.rhel_versions);
+      setOracleVersions(distrosData.oracle_versions);
+      setRockyVersions(distrosData.rocky_versions);
+      setAlmaVersions(distrosData.alma_versions);
       
-      // Fetch jobs and metrics
-      await Promise.all([fetchJobs(true), fetchMetrics()]);
+      // Fetch jobs and metrics - explicitly pass "all" filter and page 1
+      await Promise.all([fetchJobs(true, "all", 1), fetchMetrics()]);
       
       setError("");
     } catch (err: unknown) {
@@ -177,26 +240,45 @@ export default function SymGenPage() {
 
   const fetchMetrics = async () => {
     try {
-      const metricsData = await symgenApi.getMetrics();
+      const [metricsData, statusData] = await Promise.all([
+        symgenApi.getMetrics(),
+        symgenApi.getStatus(),
+      ]);
       setMetrics(metricsData);
+      if (statusData.queue) {
+        setQueueStatus(statusData.queue);
+      }
     } catch (err) {
       console.error("Failed to fetch metrics:", err);
     }
   };
 
-  const fetchJobs = async (isInitialFetch: boolean = false) => {
+  // Keep ref updated so WebSocket handler can call latest fetchMetrics
+  useEffect(() => {
+    fetchMetricsRef.current = fetchMetrics;
+  });
+
+  const fetchJobs = async (
+    isInitialFetch: boolean = false, 
+    filterOverride?: "all" | "in_progress" | "completed" | "failed",
+    pageOverride?: number
+  ) => {
     try {
-      const response = await symgenApi.listJobs(jobsPage, PAGE_SIZE);
+      // Pass status filter to API (undefined for "all")
+      const currentFilter = filterOverride ?? statusFilter;
+      const currentPage = pageOverride ?? jobsPageRef.current;
+      const apiStatusFilter = currentFilter === "all" ? undefined : currentFilter;
+      const response = await symgenApi.listJobs(currentPage, PAGE_SIZE, apiStatusFilter);
       
       if (isInitialFetch) {
+        // Full fetch: replace all jobs with fetched data
         setJobs(response.items);
       } else {
+        // Polling update: only update status of jobs already displayed on this page
+        // Don't add new jobs or change the list - just update existing job statuses
         setJobs(prev => {
           const fetchedMap = new Map(response.items.map(j => [j.id, j]));
-          const merged = prev.map(job => fetchedMap.get(job.id) || job);
-          const existingIds = new Set(prev.map(j => j.id));
-          const newJobs = response.items.filter(j => !existingIds.has(j.id));
-          return [...newJobs, ...merged].slice(0, PAGE_SIZE);
+          return prev.map(job => fetchedMap.get(job.id) || job);
         });
       }
       
@@ -219,6 +301,8 @@ export default function SymGenPage() {
       ));
       toast.success("Job cancelled");
       setError("");
+      // Refresh metrics to update stats cards
+      fetchMetrics();
     } catch (err: unknown) {
       const error = err as { response?: { data?: { detail?: string } } };
       toast.error("Failed to cancel job", {
@@ -239,6 +323,10 @@ export default function SymGenPage() {
       setJobsTotal(prev => Math.max(0, prev - 1));
       toast.success("Job deleted");
       setError("");
+      // Refresh metrics to update stats cards
+      fetchMetrics();
+      // Refetch jobs to update pagination if needed
+      fetchJobs(true);
     } catch (err: unknown) {
       const error = err as { response?: { data?: { detail?: string } } };
       toast.error("Failed to delete job", {
@@ -253,16 +341,16 @@ export default function SymGenPage() {
   const getStatusIcon = (status: SymGenStatus) => {
     switch (status) {
       case "completed":
-        return <CheckCircle2 className="h-4 w-4 text-emerald-500" />;
+        return <CheckCircle2 className="h-4 w-4 text-emerald-500" aria-hidden="true" />;
       case "failed":
-        return <XCircle className="h-4 w-4 text-red-500" />;
+        return <XCircle className="h-4 w-4 text-red-500" aria-hidden="true" />;
       case "running":
       case "pulling_image":
       case "downloading_kernel":
       case "generating_symbol":
-        return <Loader2 className="h-4 w-4 text-blue-500 animate-spin" />;
+        return <Loader2 className="h-4 w-4 text-blue-500 motion-safe:animate-spin" aria-hidden="true" />;
       default:
-        return <Clock className="h-4 w-4 text-amber-500" />;
+        return <Clock className="h-4 w-4 text-amber-500" aria-hidden="true" />;
     }
   };
 
@@ -312,11 +400,26 @@ export default function SymGenPage() {
     return ["pending", "pulling_image", "running", "downloading_kernel", "generating_symbol"].includes(status);
   };
 
-  // Filter jobs by search query
+  // Get the version string for a job based on its distro
+  const getJobVersion = (job: SymGenJob): string | null => {
+    switch (job.distro) {
+      case "ubuntu": return job.ubuntu_version ?? null;
+      case "debian": return job.debian_version ?? null;
+      case "fedora": return job.fedora_version ?? null;
+      case "centos": return job.centos_version ?? null;
+      case "rhel": return job.rhel_version ?? null;
+      case "oracle": return job.oracle_version ?? null;
+      case "rocky": return job.rocky_version ?? null;
+      case "alma": return job.alma_version ?? null;
+      default: return null;
+    }
+  };
+
+  // Filter jobs by search query only (status filter is done server-side)
   const filteredJobs = searchQuery
     ? jobs.filter(job => {
         const query = searchQuery.toLowerCase();
-        const version = job.distro === "debian" ? job.debian_version : job.ubuntu_version;
+        const version = getJobVersion(job);
         return (
           job.kernel_version.toLowerCase().includes(query) ||
           job.distro.toLowerCase().includes(query) ||
@@ -325,10 +428,10 @@ export default function SymGenPage() {
       })
     : jobs;
 
-  // Stats
-  const runningJobs = jobs.filter(j => isJobInProgress(j.status)).length;
-  const completedJobs = jobs.filter(j => j.status === "completed").length;
-  const failedJobs = jobs.filter(j => j.status === "failed").length;
+  // Stats - use metrics from API for accurate counts across all pages
+  const runningJobs = metrics?.in_progress_jobs ?? jobs.filter(j => isJobInProgress(j.status)).length;
+  const completedJobs = metrics?.completed_jobs ?? jobs.filter(j => j.status === "completed").length;
+  const failedJobs = metrics?.failed_jobs ?? jobs.filter(j => j.status === "failed").length;
 
   if (!mounted) return null;
 
@@ -340,7 +443,7 @@ export default function SymGenPage() {
         {/* Page Header */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary" aria-hidden="true">
               <Database className="h-5 w-5 text-primary-foreground" />
             </div>
             <div>
@@ -353,22 +456,22 @@ export default function SymGenPage() {
               "gap-1.5",
               wsConnected ? "border-green-500/50 text-green-600" : "border-muted text-muted-foreground"
             )}>
-              {wsConnected ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
+              {wsConnected ? <Wifi className="h-3 w-3" aria-hidden="true" /> : <WifiOff className="h-3 w-3" aria-hidden="true" />}
               {wsConnected ? "Live" : "Polling"}
             </Badge>
             <Button
               onClick={() => setGenerateDialogOpen(true)}
               disabled={!dockerAvailable}
             >
-              <Plus className="mr-2 h-4 w-4" />
+              <Plus className="mr-2 h-4 w-4" aria-hidden="true" />
               Generate Symbol
             </Button>
           </div>
         </div>
         {error && (
-          <Card className="border-red-500/50 bg-red-500/10">
+          <Card className="border-red-500/50 bg-red-500/10" role="alert">
             <CardContent className="flex items-center gap-3 py-4">
-              <XCircle className="h-5 w-5 text-red-500" />
+              <XCircle className="h-5 w-5 text-red-500 shrink-0" aria-hidden="true" />
               <p className="text-red-600">{error}</p>
             </CardContent>
           </Card>
@@ -376,9 +479,9 @@ export default function SymGenPage() {
 
         {/* Docker Status Banner */}
         {!dockerAvailable && !isLoading && (
-          <Card className="border-amber-500/50 bg-amber-500/10">
+          <Card className="border-amber-500/50 bg-amber-500/10" role="alert">
             <CardContent className="flex items-start gap-3 py-4">
-              <AlertTriangle className="h-5 w-5 text-amber-500 mt-0.5" />
+              <AlertTriangle className="h-5 w-5 text-amber-500 mt-0.5 shrink-0" aria-hidden="true" />
               <div>
                 <h3 className="font-semibold text-amber-800 dark:text-amber-200">Docker Not Available</h3>
                 <p className="text-sm text-amber-700 dark:text-amber-300 mt-1">
@@ -390,8 +493,8 @@ export default function SymGenPage() {
         )}
 
         {isLoading ? (
-          <div className="flex items-center justify-center py-20">
-            <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+          <div className="flex items-center justify-center py-20" aria-label="Loading…">
+            <Loader2 className="h-8 w-8 motion-safe:animate-spin text-muted-foreground" aria-hidden="true" />
           </div>
         ) : (
           <>
@@ -400,43 +503,43 @@ export default function SymGenPage() {
               <Card>
                 <CardHeader className="pb-2">
                   <CardDescription className="flex items-center gap-1.5">
-                    <Database className="h-3.5 w-3.5" />
+                    <Database className="h-3.5 w-3.5" aria-hidden="true" />
                     Total Jobs
                   </CardDescription>
-                  <CardTitle className="text-2xl">{metrics?.total_jobs ?? jobsTotal}</CardTitle>
+                  <CardTitle className="text-2xl font-variant-numeric:tabular-nums">{metrics?.total_jobs ?? jobsTotal}</CardTitle>
                 </CardHeader>
               </Card>
               <Card>
                 <CardHeader className="pb-2">
                   <CardDescription className="flex items-center gap-1.5">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" aria-hidden="true" />
                     In Progress
                   </CardDescription>
-                  <CardTitle className="text-2xl text-blue-600">{metrics?.in_progress_jobs ?? runningJobs}</CardTitle>
+                  <CardTitle className="text-2xl text-blue-600 tabular-nums">{metrics?.in_progress_jobs ?? runningJobs}</CardTitle>
                 </CardHeader>
               </Card>
               <Card>
                 <CardHeader className="pb-2">
                   <CardDescription className="flex items-center gap-1.5">
-                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
                     Completed
                   </CardDescription>
-                  <CardTitle className="text-2xl text-emerald-600">{metrics?.completed_jobs ?? completedJobs}</CardTitle>
+                  <CardTitle className="text-2xl text-emerald-600 tabular-nums">{metrics?.completed_jobs ?? completedJobs}</CardTitle>
                 </CardHeader>
               </Card>
               <Card>
                 <CardHeader className="pb-2">
                   <CardDescription className="flex items-center gap-1.5">
-                    <XCircle className="h-3.5 w-3.5" />
+                    <XCircle className="h-3.5 w-3.5" aria-hidden="true" />
                     Failed
                   </CardDescription>
-                  <CardTitle className="text-2xl text-red-600">{metrics?.failed_jobs ?? failedJobs}</CardTitle>
+                  <CardTitle className="text-2xl text-red-600 tabular-nums">{metrics?.failed_jobs ?? failedJobs}</CardTitle>
                 </CardHeader>
               </Card>
               <Card>
                 <CardHeader className="pb-2">
                   <CardDescription className="flex items-center gap-1.5">
-                    <HardDrive className="h-3.5 w-3.5" />
+                    <HardDrive className="h-3.5 w-3.5" aria-hidden="true" />
                     Storage
                   </CardDescription>
                   <CardTitle className="text-2xl">{metrics?.total_storage_formatted ?? "0 B"}</CardTitle>
@@ -445,10 +548,23 @@ export default function SymGenPage() {
               <Card>
                 <CardHeader className="pb-2">
                   <CardDescription className="flex items-center gap-1.5">
-                    <Timer className="h-3.5 w-3.5" />
-                    Avg. Time
+                    <ListOrdered className="h-3.5 w-3.5" aria-hidden="true" />
+                    Queue
                   </CardDescription>
-                  <CardTitle className="text-2xl">{metrics?.avg_completion_time_formatted ?? "-"}</CardTitle>
+                  <CardTitle className="text-2xl tabular-nums">
+                    {queueStatus ? (
+                      <span className={cn(
+                        queueStatus.running >= queueStatus.max_concurrent ? "text-amber-600" : "text-emerald-600"
+                      )}>
+                        {queueStatus.running}/{queueStatus.max_concurrent}
+                      </span>
+                    ) : "-"}
+                    {queueStatus && queueStatus.queued > 0 && (
+                      <span className="text-sm text-muted-foreground ml-1">
+                        (+{queueStatus.queued})
+                      </span>
+                    )}
+                  </CardTitle>
                 </CardHeader>
               </Card>
             </div>
@@ -456,29 +572,110 @@ export default function SymGenPage() {
             {/* Jobs List */}
             <Card>
               <CardHeader>
-                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                  <div>
-                    <CardTitle>Generation Jobs</CardTitle>
-                    <CardDescription>Track symbol generation progress</CardDescription>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <div className="relative">
-                      <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                      <input
-                        type="text"
-                        placeholder="Search kernels..."
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        className="h-9 w-64 rounded-md border border-input bg-background pl-9 pr-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                      />
+                <div className="flex flex-col gap-4">
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div>
+                      <CardTitle>Generation Jobs</CardTitle>
+                      <CardDescription>Track symbol generation progress</CardDescription>
                     </div>
+                    <div className="flex items-center gap-3">
+                      <div className="relative">
+                        <label htmlFor="search-kernels" className="sr-only">Search kernels</label>
+                        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground pointer-events-none" aria-hidden="true" />
+                        <input
+                          id="search-kernels"
+                          type="search"
+                          placeholder="Search kernels…"
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          autoComplete="off"
+                          spellCheck={false}
+                          className="h-9 w-64 rounded-md border border-input bg-background pl-9 pr-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        />
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => fetchJobs(true)}
+                      >
+                        <RefreshCw className="mr-2 h-4 w-4" aria-hidden="true" />
+                        Refresh
+                      </Button>
+                    </div>
+                  </div>
+                  {/* Status Filter Tabs */}
+                  <div className="flex items-center gap-2" role="group" aria-label="Filter jobs by status">
                     <Button
-                      variant="outline"
+                      variant={statusFilter === "all" ? "default" : "outline"}
                       size="sm"
-                      onClick={() => fetchJobs(false)}
+                      onClick={() => setStatusFilter("all")}
+                      className="h-8"
+                      aria-pressed={statusFilter === "all"}
                     >
-                      <RefreshCw className="mr-2 h-4 w-4" />
-                      Refresh
+                      All
+                    </Button>
+                    <Button
+                      variant={statusFilter === "in_progress" ? "default" : "outline"}
+                      size="sm"
+                      onClick={() => setStatusFilter("in_progress")}
+                      className={cn(
+                        "h-8 gap-1.5",
+                        statusFilter === "in_progress" && "bg-blue-600 hover:bg-blue-700"
+                      )}
+                      aria-pressed={statusFilter === "in_progress"}
+                    >
+                      <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" aria-hidden="true" />
+                      In Progress
+                      {runningJobs > 0 ? (
+                        <span className={cn(
+                          "ml-1 rounded-full px-1.5 py-0.5 text-xs tabular-nums",
+                          statusFilter === "in_progress" ? "bg-blue-500" : "bg-blue-100 text-blue-700"
+                        )}>
+                          {runningJobs}
+                        </span>
+                      ) : null}
+                    </Button>
+                    <Button
+                      variant={statusFilter === "completed" ? "default" : "outline"}
+                      size="sm"
+                      onClick={() => setStatusFilter("completed")}
+                      className={cn(
+                        "h-8 gap-1.5",
+                        statusFilter === "completed" && "bg-emerald-600 hover:bg-emerald-700"
+                      )}
+                      aria-pressed={statusFilter === "completed"}
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                      Completed
+                      {completedJobs > 0 ? (
+                        <span className={cn(
+                          "ml-1 rounded-full px-1.5 py-0.5 text-xs tabular-nums",
+                          statusFilter === "completed" ? "bg-emerald-500" : "bg-emerald-100 text-emerald-700"
+                        )}>
+                          {completedJobs}
+                        </span>
+                      ) : null}
+                    </Button>
+                    <Button
+                      variant={statusFilter === "failed" ? "default" : "outline"}
+                      size="sm"
+                      onClick={() => setStatusFilter("failed")}
+                      className={cn(
+                        "h-8 gap-1.5",
+                        statusFilter === "failed" && "bg-red-600 hover:bg-red-700"
+                      )}
+                      aria-pressed={statusFilter === "failed"}
+                    >
+                      <XCircle className="h-3.5 w-3.5" aria-hidden="true" />
+                      Failed
+                      {failedJobs > 0 ? (
+                        <span className={cn(
+                          "ml-1 rounded-full px-1.5 py-0.5 text-xs tabular-nums",
+                          statusFilter === "failed" ? "bg-red-500" : "bg-red-100 text-red-700"
+                        )}>
+                          {failedJobs}
+                        </span>
+                      ) : null}
                     </Button>
                   </div>
                 </div>
@@ -486,17 +683,17 @@ export default function SymGenPage() {
               <CardContent>
                 {filteredJobs.length === 0 ? (
                   <div className="py-16 text-center">
-                    <Database className="mx-auto h-12 w-12 text-muted-foreground/50" />
+                    <Database className="mx-auto h-12 w-12 text-muted-foreground/50" aria-hidden="true" />
                     <p className="mt-4 text-muted-foreground">
-                      {searchQuery ? "No matching jobs" : "No generation jobs yet"}
+                      {searchQuery || statusFilter !== "all" ? "No matching jobs" : "No generation jobs yet"}
                     </p>
-                    {!searchQuery && (
+                    {!searchQuery && statusFilter === "all" && (
                       <Button
                         onClick={() => setGenerateDialogOpen(true)}
                         disabled={!dockerAvailable}
                         className="mt-4"
                       >
-                        <Plus className="mr-2 h-4 w-4" />
+                        <Plus className="mr-2 h-4 w-4" aria-hidden="true" />
                         Generate Symbol
                       </Button>
                     )}
@@ -508,9 +705,9 @@ export default function SymGenPage() {
                         <div className="flex items-start justify-between gap-4">
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-3 flex-wrap">
-                              <p className="font-semibold font-mono">{job.kernel_version}</p>
+                              <p className="font-semibold font-mono truncate">{job.kernel_version}</p>
                               <Badge variant="secondary" className="capitalize">
-                                {job.distro} {job.distro === "debian" ? job.debian_version : job.ubuntu_version}
+                                {job.distro} {getJobVersion(job)}
                               </Badge>
                               <Badge variant="outline" className={cn(
                                 "gap-1.5",
@@ -529,11 +726,11 @@ export default function SymGenPage() {
                             {job.symbol_filename && job.status === "completed" && (
                               <p className="text-sm text-muted-foreground mt-1">
                                 {job.symbol_filename}
-                                {job.symbol_file_size && (
+                                {job.symbol_file_size ? (
                                   <span className="text-muted-foreground/70 ml-2">
-                                    ({(job.symbol_file_size / 1024 / 1024).toFixed(1)} MB)
+                                    ({(job.symbol_file_size / 1024 / 1024).toFixed(1)}&nbsp;MB)
                                   </span>
-                                )}
+                                ) : null}
                               </p>
                             )}
                             <p className="text-xs text-muted-foreground mt-2">
@@ -550,7 +747,7 @@ export default function SymGenPage() {
                                   setCancelDialogOpen(true);
                                 }}
                               >
-                                <X className="mr-2 h-4 w-4" />
+                                <X className="mr-2 h-4 w-4" aria-hidden="true" />
                                 Cancel
                               </Button>
                             )}
@@ -560,7 +757,7 @@ export default function SymGenPage() {
                                 asChild
                               >
                                 <a href={symgenApi.getDownloadUrl(job.id)} download>
-                                  <Download className="mr-2 h-4 w-4" />
+                                  <Download className="mr-2 h-4 w-4" aria-hidden="true" />
                                   Download
                                 </a>
                               </Button>
@@ -573,8 +770,9 @@ export default function SymGenPage() {
                                   setJobToDelete(job);
                                   setDeleteDialogOpen(true);
                                 }}
+                                aria-label={`Delete job for ${job.kernel_version}`}
                               >
-                                <Trash2 className="h-4 w-4" />
+                                <Trash2 className="h-4 w-4" aria-hidden="true" />
                               </Button>
                             )}
                           </div>
@@ -594,7 +792,7 @@ export default function SymGenPage() {
                   </div>
                 )}
 
-                {/* Pagination */}
+                {/* Pagination - show for server-side filtered results, hide for client-side search */}
                 {jobsTotalPages > 1 && !searchQuery && (
                   <div className="flex items-center justify-between pt-4 border-t border-border mt-4">
                     <p className="text-sm text-muted-foreground">
@@ -634,7 +832,14 @@ export default function SymGenPage() {
           distros={distros}
           ubuntuVersions={ubuntuVersions}
           debianVersions={debianVersions}
+          fedoraVersions={fedoraVersions}
+          centosVersions={centosVersions}
+          rhelVersions={rhelVersions}
+          oracleVersions={oracleVersions}
+          rockyVersions={rockyVersions}
+          almaVersions={almaVersions}
           onJobCreated={handleJobCreated}
+          queueStatus={queueStatus}
         />
       )}
 
@@ -676,28 +881,72 @@ function GenerateDialog({
   distros,
   ubuntuVersions,
   debianVersions,
+  fedoraVersions,
+  centosVersions,
+  rhelVersions,
+  oracleVersions,
+  rockyVersions,
+  almaVersions,
   onJobCreated,
+  queueStatus,
 }: {
   open: boolean;
   onClose: () => void;
   distros: DistroOption[];
   ubuntuVersions: UbuntuVersionOption[];
   debianVersions: DebianVersionOption[];
+  fedoraVersions: FedoraVersionOption[];
+  centosVersions: CentOSVersionOption[];
+  rhelVersions: RHELVersionOption[];
+  oracleVersions: OracleVersionOption[];
+  rockyVersions: RockyVersionOption[];
+  almaVersions: AlmaVersionOption[];
   onJobCreated: (job: SymGenJob) => void;
+  queueStatus: QueueStatus | null;
 }) {
   const [kernelVersion, setKernelVersion] = useState("");
   const [distro, setDistro] = useState<LinuxDistro | "">("");
   const [ubuntuVersion, setUbuntuVersion] = useState<UbuntuVersion | "">("");
   const [debianVersion, setDebianVersion] = useState<DebianVersion | "">("");
+  const [fedoraVersion, setFedoraVersion] = useState<FedoraVersion | "">("");
+  const [centosVersion, setCentosVersion] = useState<CentOSVersion | "">("");
+  const [rhelVersion, setRhelVersion] = useState<RHELVersion | "">("");
+  const [oracleVersion, setOracleVersion] = useState<OracleVersion | "">("");
+  const [rockyVersion, setRockyVersion] = useState<RockyVersion | "">("");
+  const [almaVersion, setAlmaVersion] = useState<AlmaVersion | "">("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [bannerInput, setBannerInput] = useState("");
   const [isParsing, setIsParsing] = useState(false);
   const [parseMessage, setParseMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
-  const handleDistroChange = (value: LinuxDistro) => {
-    setDistro(value);
+  const resetVersions = () => {
     setUbuntuVersion("");
     setDebianVersion("");
+    setFedoraVersion("");
+    setCentosVersion("");
+    setRhelVersion("");
+    setOracleVersion("");
+    setRockyVersion("");
+    setAlmaVersion("");
+  };
+
+  const handleDistroChange = (value: LinuxDistro) => {
+    setDistro(value);
+    resetVersions();
+  };
+
+  const getSelectedVersion = (): string | null => {
+    switch (distro) {
+      case "ubuntu": return ubuntuVersion || null;
+      case "debian": return debianVersion || null;
+      case "fedora": return fedoraVersion || null;
+      case "centos": return centosVersion || null;
+      case "rhel": return rhelVersion || null;
+      case "oracle": return oracleVersion || null;
+      case "rocky": return rockyVersion || null;
+      case "alma": return almaVersion || null;
+      default: return null;
+    }
   };
 
   const handleBannerPaste = async (value: string) => {
@@ -707,21 +956,32 @@ function GenerateDialog({
     if (!value.trim()) return;
     
     // Auto-detect if it looks like a kernel banner
-    if (value.includes("Linux version") || value.includes("ubuntu") || value.includes("debian") || value.includes("generic") || value.includes("amd64")) {
+    const bannerIndicators = ["Linux version", "ubuntu", "debian", "fedora", "centos", "red hat", "rocky", "alma", "oracle", "generic", "amd64", ".fc", ".el"];
+    if (bannerIndicators.some(ind => value.toLowerCase().includes(ind.toLowerCase()))) {
       setIsParsing(true);
       try {
         const result = await symgenApi.parseBanner(value);
         if (result.success && result.kernel_version) {
           setKernelVersion(result.kernel_version);
+          resetVersions();
           if (result.distro) {
             setDistro(result.distro);
-            if (result.distro === "ubuntu" && result.ubuntu_version) {
-              setUbuntuVersion(result.ubuntu_version);
-            } else if (result.distro === "debian" && result.debian_version) {
-              setDebianVersion(result.debian_version);
-            }
+            if (result.ubuntu_version) setUbuntuVersion(result.ubuntu_version);
+            if (result.debian_version) setDebianVersion(result.debian_version);
+            if (result.fedora_version) setFedoraVersion(result.fedora_version);
+            if (result.centos_version) setCentosVersion(result.centos_version);
+            if (result.rhel_version) setRhelVersion(result.rhel_version);
+            if (result.oracle_version) setOracleVersion(result.oracle_version);
+            if (result.rocky_version) setRockyVersion(result.rocky_version);
+            if (result.alma_version) setAlmaVersion(result.alma_version);
           }
-          setParseMessage({ type: "success", text: `Detected: ${result.kernel_version} (${result.distro}${result.ubuntu_version ? ` ${result.ubuntu_version}` : ""}${result.debian_version ? ` ${result.debian_version}` : ""})` });
+          const version = result.ubuntu_version || result.debian_version || result.fedora_version || 
+                         result.centos_version || result.rhel_version || result.oracle_version ||
+                         result.rocky_version || result.alma_version;
+          setParseMessage({ 
+            type: "success", 
+            text: `Detected: ${result.kernel_version} (${result.distro}${version ? ` ${version}` : ""})` 
+          });
         } else {
           setParseMessage({ type: "error", text: result.message || "Could not parse banner" });
         }
@@ -735,9 +995,8 @@ function GenerateDialog({
 
   const isFormValid = () => {
     if (!kernelVersion.trim() || !distro) return false;
-    if (distro === "ubuntu" && !ubuntuVersion) return false;
-    if (distro === "debian" && !debianVersion) return false;
-    return true;
+    const version = getSelectedVersion();
+    return version !== null && version !== "";
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -747,11 +1006,18 @@ function GenerateDialog({
     setIsSubmitting(true);
     const kernel = kernelVersion.trim();
     const selectedDistro = distro as LinuxDistro;
-    const ubuntu = distro === "ubuntu" ? (ubuntuVersion as UbuntuVersion) : undefined;
-    const debian = distro === "debian" ? (debianVersion as DebianVersion) : undefined;
     
     try {
-      const job = await symgenApi.generate(kernel, selectedDistro, ubuntu, debian);
+      const job = await symgenApi.generate(kernel, selectedDistro, {
+        ubuntuVersion: distro === "ubuntu" ? (ubuntuVersion as UbuntuVersion) : undefined,
+        debianVersion: distro === "debian" ? (debianVersion as DebianVersion) : undefined,
+        fedoraVersion: distro === "fedora" ? (fedoraVersion as FedoraVersion) : undefined,
+        centosVersion: distro === "centos" ? (centosVersion as CentOSVersion) : undefined,
+        rhelVersion: distro === "rhel" ? (rhelVersion as RHELVersion) : undefined,
+        oracleVersion: distro === "oracle" ? (oracleVersion as OracleVersion) : undefined,
+        rockyVersion: distro === "rocky" ? (rockyVersion as RockyVersion) : undefined,
+        almaVersion: distro === "alma" ? (almaVersion as AlmaVersion) : undefined,
+      });
       onJobCreated(job);
       
       // Check if this is an existing completed job (API returns it instead of creating new)
@@ -768,8 +1034,7 @@ function GenerateDialog({
       onClose();
       setKernelVersion("");
       setDistro("");
-      setUbuntuVersion("");
-      setDebianVersion("");
+      resetVersions();
       setBannerInput("");
       setParseMessage(null);
     } catch (err: unknown) {
@@ -793,11 +1058,20 @@ function GenerateDialog({
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="fixed inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <Card className="relative z-10 w-full max-w-md mx-4 shadow-2xl">
+    <div 
+      className="fixed inset-0 z-50 flex items-center justify-center overscroll-contain"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="generate-dialog-title"
+    >
+      <div 
+        className="fixed inset-0 bg-black/50 backdrop-blur-sm" 
+        onClick={onClose}
+        aria-hidden="true"
+      />
+      <Card className="relative z-10 w-full max-w-md mx-4 shadow-2xl max-h-[90vh] overflow-y-auto overscroll-contain">
         <CardHeader>
-          <CardTitle>Generate Linux Symbol</CardTitle>
+          <CardTitle id="generate-dialog-title">Generate Linux Symbol</CardTitle>
           <CardDescription>
             Paste a Volatility banner or enter kernel details manually
           </CardDescription>
@@ -806,24 +1080,31 @@ function GenerateDialog({
           <form onSubmit={handleSubmit} className="space-y-4">
             {/* Banner paste area */}
             <div>
-              <label className="text-sm font-medium">Kernel Banner (optional)</label>
+              <label htmlFor="kernel-banner" className="text-sm font-medium">Kernel Banner (optional)</label>
               <textarea
+                id="kernel-banner"
                 value={bannerInput}
                 onChange={(e) => handleBannerPaste(e.target.value)}
-                placeholder='Paste Volatility banner, e.g.:&#10;Linux version 5.15.0-91-generic (buildd@...) (gcc (Ubuntu 11.4.0-1ubuntu1~22.04) ...)'
-                className="mt-1.5 h-20 w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-ring resize-none"
+                placeholder="Paste Volatility banner, e.g.:
+Linux version 5.15.0-91-generic (buildd@…) (gcc (Ubuntu 11.4.0-1ubuntu1~22.04) …)"
+                autoComplete="off"
+                spellCheck={false}
+                className="mt-1.5 h-20 w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono focus:outline-none focus-visible:ring-2 focus-visible:ring-ring resize-none"
               />
               {isParsing && (
-                <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                  Parsing banner...
+                <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1" aria-live="polite">
+                  <Loader2 className="h-3 w-3 motion-safe:animate-spin" aria-hidden="true" />
+                  Parsing banner…
                 </p>
               )}
               {parseMessage && (
-                <p className={cn(
-                  "text-xs mt-1",
-                  parseMessage.type === "success" ? "text-emerald-600" : "text-red-500"
-                )}>
+                <p 
+                  className={cn(
+                    "text-xs mt-1",
+                    parseMessage.type === "success" ? "text-emerald-600" : "text-red-500"
+                  )}
+                  aria-live="polite"
+                >
                   {parseMessage.text}
                 </p>
               )}
@@ -839,24 +1120,30 @@ function GenerateDialog({
             </div>
 
             <div>
-              <label className="text-sm font-medium">Kernel Version</label>
+              <label htmlFor="kernel-version" className="text-sm font-medium">Kernel Version</label>
               <input
+                id="kernel-version"
                 type="text"
+                name="kernel_version"
                 value={kernelVersion}
                 onChange={(e) => setKernelVersion(e.target.value)}
                 placeholder="e.g., 5.15.0-91-generic"
-                className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                autoComplete="off"
+                spellCheck={false}
+                className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 required
               />
             </div>
             <div>
-              <label className="text-sm font-medium">Linux Distribution</label>
+              <label htmlFor="linux-distro" className="text-sm font-medium">Linux Distribution</label>
               <select
+                id="linux-distro"
+                name="distro"
                 value={distro}
                 onChange={(e) => handleDistroChange(e.target.value as LinuxDistro)}
-                className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
-                <option value="">Select distribution</option>
+                <option value="">Select distribution…</option>
                 {distros.map((d) => (
                   <option key={d.value} value={d.value}>
                     {d.label}
@@ -866,13 +1153,15 @@ function GenerateDialog({
             </div>
             {distro === "ubuntu" && (
               <div>
-                <label className="text-sm font-medium">Ubuntu Version</label>
+                <label htmlFor="ubuntu-version" className="text-sm font-medium">Ubuntu Version</label>
                 <select
+                  id="ubuntu-version"
+                  name="ubuntu_version"
                   value={ubuntuVersion}
                   onChange={(e) => setUbuntuVersion(e.target.value as UbuntuVersion)}
-                  className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  <option value="">Select Ubuntu version</option>
+                  <option value="">Select Ubuntu version…</option>
                   {ubuntuVersions.map((v) => (
                     <option key={v.value} value={v.value}>
                       {v.label}
@@ -883,13 +1172,15 @@ function GenerateDialog({
             )}
             {distro === "debian" && (
               <div>
-                <label className="text-sm font-medium">Debian Version</label>
+                <label htmlFor="debian-version" className="text-sm font-medium">Debian Version</label>
                 <select
+                  id="debian-version"
+                  name="debian_version"
                   value={debianVersion}
                   onChange={(e) => setDebianVersion(e.target.value as DebianVersion)}
-                  className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  <option value="">Select Debian version</option>
+                  <option value="">Select Debian version…</option>
                   {debianVersions.map((v) => (
                     <option key={v.value} value={v.value}>
                       {v.label}
@@ -898,6 +1189,133 @@ function GenerateDialog({
                 </select>
               </div>
             )}
+            {distro === "fedora" && (
+              <div>
+                <label htmlFor="fedora-version" className="text-sm font-medium">Fedora Version</label>
+                <select
+                  id="fedora-version"
+                  name="fedora_version"
+                  value={fedoraVersion}
+                  onChange={(e) => setFedoraVersion(e.target.value as FedoraVersion)}
+                  className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="">Select Fedora version…</option>
+                  {fedoraVersions.map((v) => (
+                    <option key={v.value} value={v.value}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {distro === "centos" && (
+              <div>
+                <label htmlFor="centos-version" className="text-sm font-medium">CentOS Version</label>
+                <select
+                  id="centos-version"
+                  name="centos_version"
+                  value={centosVersion}
+                  onChange={(e) => setCentosVersion(e.target.value as CentOSVersion)}
+                  className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="">Select CentOS version…</option>
+                  {centosVersions.map((v) => (
+                    <option key={v.value} value={v.value}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {distro === "rhel" && (
+              <div>
+                <label htmlFor="rhel-version" className="text-sm font-medium">RHEL Version</label>
+                <select
+                  id="rhel-version"
+                  name="rhel_version"
+                  value={rhelVersion}
+                  onChange={(e) => setRhelVersion(e.target.value as RHELVersion)}
+                  className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="">Select RHEL version…</option>
+                  {rhelVersions.map((v) => (
+                    <option key={v.value} value={v.value}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {distro === "oracle" && (
+              <div>
+                <label htmlFor="oracle-version" className="text-sm font-medium">Oracle Linux Version</label>
+                <select
+                  id="oracle-version"
+                  name="oracle_version"
+                  value={oracleVersion}
+                  onChange={(e) => setOracleVersion(e.target.value as OracleVersion)}
+                  className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="">Select Oracle Linux version…</option>
+                  {oracleVersions.map((v) => (
+                    <option key={v.value} value={v.value}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {distro === "rocky" && (
+              <div>
+                <label htmlFor="rocky-version" className="text-sm font-medium">Rocky Linux Version</label>
+                <select
+                  id="rocky-version"
+                  name="rocky_version"
+                  value={rockyVersion}
+                  onChange={(e) => setRockyVersion(e.target.value as RockyVersion)}
+                  className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="">Select Rocky Linux version…</option>
+                  {rockyVersions.map((v) => (
+                    <option key={v.value} value={v.value}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {distro === "alma" && (
+              <div>
+                <label htmlFor="alma-version" className="text-sm font-medium">AlmaLinux Version</label>
+                <select
+                  id="alma-version"
+                  name="alma_version"
+                  value={almaVersion}
+                  onChange={(e) => setAlmaVersion(e.target.value as AlmaVersion)}
+                  className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="">Select AlmaLinux version…</option>
+                  {almaVersions.map((v) => (
+                    <option key={v.value} value={v.value}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {/* Queue status warning */}
+            {queueStatus && queueStatus.running >= queueStatus.max_concurrent && (
+              <div className="flex items-center gap-2 p-3 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-700 dark:text-amber-400 text-sm">
+                <Clock className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>
+                  Queue is full ({queueStatus.running}/{queueStatus.max_concurrent} running
+                  {queueStatus.queued > 0 && `, ${queueStatus.queued} waiting`}).
+                  Your job will be queued.
+                </span>
+              </div>
+            )}
+
             <div className="flex justify-end gap-3 pt-4">
               <Button
                 type="button"
@@ -912,9 +1330,11 @@ function GenerateDialog({
               >
                 {isSubmitting ? (
                   <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Starting...
+                    <Loader2 className="mr-2 h-4 w-4 motion-safe:animate-spin" aria-hidden="true" />
+                    Starting…
                   </>
+                ) : queueStatus && queueStatus.running >= queueStatus.max_concurrent ? (
+                  "Add to Queue"
                 ) : (
                   "Generate"
                 )}
@@ -942,14 +1362,24 @@ function ConfirmDialog({
   onCancel: () => void;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="fixed inset-0 bg-black/50 backdrop-blur-sm" onClick={onCancel} />
-      <Card className="relative z-10 w-full max-w-md mx-4 shadow-2xl">
+    <div 
+      className="fixed inset-0 z-50 flex items-center justify-center overscroll-contain"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="confirm-dialog-title"
+      aria-describedby="confirm-dialog-description"
+    >
+      <div 
+        className="fixed inset-0 bg-black/50 backdrop-blur-sm" 
+        onClick={onCancel}
+        aria-hidden="true"
+      />
+      <Card className="relative z-10 w-full max-w-md mx-4 shadow-2xl overscroll-contain">
         <CardHeader>
-          <CardTitle>{title}</CardTitle>
+          <CardTitle id="confirm-dialog-title">{title}</CardTitle>
         </CardHeader>
         <CardContent>
-          <p className="text-muted-foreground">{message}</p>
+          <p id="confirm-dialog-description" className="text-muted-foreground">{message}</p>
         </CardContent>
         <div className="flex justify-end gap-3 px-6 pb-6">
           <Button variant="outline" onClick={onCancel}>

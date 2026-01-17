@@ -15,16 +15,25 @@ import glob as glob_module
 import threading
 import queue
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
+from collections import deque
 
 import docker
 from docker.errors import ImageNotFound, ContainerError, APIError
 from sqlalchemy.orm import Session
 
-from app.models import SymbolGeneration, SymGenStatus, UbuntuVersion, DebianVersion, LinuxDistro
+from app.models import (
+    SymbolGeneration, SymGenStatus, LinuxDistro,
+    UbuntuVersion, DebianVersion, FedoraVersion, CentOSVersion,
+    RHELVersion, OracleVersion, RockyVersion, AlmaVersion
+)
 from app.database import SessionLocal
+from app.websocket import manager as ws_manager
 
 logger = logging.getLogger(__name__)
+
+# Maximum concurrent jobs
+MAX_CONCURRENT_JOBS = 2
 
 # Directory paths
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/uploads")
@@ -61,13 +70,192 @@ DEBIAN_CODENAMES = {
     DebianVersion.DEBIAN_12: "bookworm",
 }
 
+# Fedora base images
+FEDORA_IMAGES = {
+    FedoraVersion.FEDORA_38: "fedora:38",
+    FedoraVersion.FEDORA_39: "fedora:39",
+    FedoraVersion.FEDORA_40: "fedora:40",
+}
+
+# CentOS base images (Stream versions)
+CENTOS_IMAGES = {
+    CentOSVersion.CENTOS_7: "centos:7",
+    CentOSVersion.CENTOS_8: "quay.io/centos/centos:stream8",
+    CentOSVersion.CENTOS_9: "quay.io/centos/centos:stream9",
+}
+
+# RHEL base images (using UBI - Universal Base Image)
+RHEL_IMAGES = {
+    RHELVersion.RHEL_8: "redhat/ubi8:latest",
+    RHELVersion.RHEL_9: "redhat/ubi9:latest",
+}
+
+# Oracle Linux base images
+ORACLE_IMAGES = {
+    OracleVersion.ORACLE_8: "oraclelinux:8",
+    OracleVersion.ORACLE_9: "oraclelinux:9",
+}
+
+# Rocky Linux base images
+ROCKY_IMAGES = {
+    RockyVersion.ROCKY_8: "rockylinux:8",
+    RockyVersion.ROCKY_9: "rockylinux:9",
+}
+
+# AlmaLinux base images
+ALMA_IMAGES = {
+    AlmaVersion.ALMA_8: "almalinux:8",
+    AlmaVersion.ALMA_9: "almalinux:9",
+}
+
+
+class JobQueue:
+    """
+    Manages a queue of symbol generation jobs with limited concurrency.
+    Only MAX_CONCURRENT_JOBS jobs run at a time, others wait in queue.
+    """
+    
+    def __init__(self, max_concurrent: int = MAX_CONCURRENT_JOBS):
+        self.max_concurrent = max_concurrent
+        self._running_jobs: Dict[int, asyncio.Task] = {}  # job_id -> task
+        self._pending_queue: deque = deque()  # Queue of (job_id, args, kwargs)
+        self._lock = asyncio.Lock()
+        self._generator = None  # Will be set by SymbolGenerator
+        logger.info(f"JobQueue initialized with max_concurrent={max_concurrent}")
+    
+    def set_generator(self, generator: 'SymbolGenerator'):
+        """Set the symbol generator instance."""
+        self._generator = generator
+    
+    @property
+    def running_count(self) -> int:
+        """Number of currently running jobs."""
+        return len(self._running_jobs)
+    
+    @property
+    def queued_count(self) -> int:
+        """Number of jobs waiting in queue."""
+        return len(self._pending_queue)
+    
+    def get_queue_position(self, job_id: int) -> Optional[int]:
+        """Get position in queue (1-based), or None if not queued."""
+        for i, (queued_id, _, _) in enumerate(self._pending_queue):
+            if queued_id == job_id:
+                return i + 1
+        return None
+    
+    def is_job_running(self, job_id: int) -> bool:
+        """Check if a job is currently running."""
+        return job_id in self._running_jobs
+    
+    async def submit_job(self, job_id: int, *args, **kwargs) -> bool:
+        """
+        Submit a job to the queue.
+        Returns True if job started immediately, False if queued.
+        """
+        async with self._lock:
+            if self.running_count < self.max_concurrent:
+                # Start immediately
+                await self._start_job(job_id, args, kwargs)
+                return True
+            else:
+                # Add to queue
+                self._pending_queue.append((job_id, args, kwargs))
+                queue_pos = len(self._pending_queue)
+                logger.info(f"Job {job_id} queued at position {queue_pos}")
+                
+                # Update job status to show queue position
+                self._update_queued_status(job_id, queue_pos)
+                return False
+    
+    def _update_queued_status(self, job_id: int, position: int):
+        """Update job status to show it's queued."""
+        db = SessionLocal()
+        try:
+            job = db.query(SymbolGeneration).filter(SymbolGeneration.id == job_id).first()
+            if job:
+                job.status_message = f"Queued (position {position} of {self.queued_count})"
+                db.commit()
+        finally:
+            db.close()
+    
+    async def _start_job(self, job_id: int, args: tuple, kwargs: dict):
+        """Start a job and track it."""
+        if not self._generator:
+            logger.error("Generator not set on JobQueue")
+            return
+        
+        # Create task for the job
+        task = asyncio.create_task(
+            self._run_job_wrapper(job_id, args, kwargs)
+        )
+        self._running_jobs[job_id] = task
+        logger.info(f"Job {job_id} started. Running: {self.running_count}, Queued: {self.queued_count}")
+    
+    async def _run_job_wrapper(self, job_id: int, args: tuple, kwargs: dict):
+        """Wrapper to run job and handle completion."""
+        try:
+            await self._generator._execute_generation(job_id, *args, **kwargs)
+        except Exception as e:
+            logger.exception(f"Job {job_id} failed with exception")
+        finally:
+            await self._on_job_complete(job_id)
+    
+    async def _on_job_complete(self, job_id: int):
+        """Handle job completion - remove from running and start next queued job."""
+        async with self._lock:
+            # Remove from running
+            if job_id in self._running_jobs:
+                del self._running_jobs[job_id]
+            
+            logger.info(f"Job {job_id} completed. Running: {self.running_count}, Queued: {self.queued_count}")
+            
+            # Start next queued job if any
+            if self._pending_queue and self.running_count < self.max_concurrent:
+                next_job_id, next_args, next_kwargs = self._pending_queue.popleft()
+                logger.info(f"Starting queued job {next_job_id}")
+                
+                # Update queue positions for remaining jobs
+                for i, (queued_id, _, _) in enumerate(self._pending_queue):
+                    self._update_queued_status(queued_id, i + 1)
+                
+                await self._start_job(next_job_id, next_args, next_kwargs)
+    
+    async def cancel_job(self, job_id: int) -> bool:
+        """Cancel a job (running or queued)."""
+        async with self._lock:
+            # Check if running
+            if job_id in self._running_jobs:
+                task = self._running_jobs[job_id]
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                return True
+            
+            # Check if queued
+            for i, (queued_id, _, _) in enumerate(self._pending_queue):
+                if queued_id == job_id:
+                    del self._pending_queue[i]
+                    # Update positions for remaining jobs
+                    for j, (qid, _, _) in enumerate(self._pending_queue):
+                        self._update_queued_status(qid, j + 1)
+                    return True
+            
+            return False
+
+
+# Global job queue instance
+job_queue = JobQueue()
+
 
 def ensure_directories():
     """Ensure required directories exist."""
     os.makedirs(SYMBOLS_DIR, exist_ok=True)
 
 
-def parse_kernel_version(banner: str) -> Optional[Tuple[str, LinuxDistro, Optional[UbuntuVersion], Optional[DebianVersion]]]:
+def parse_kernel_version(banner: str) -> Optional[dict]:
     """
     Parse kernel version and distro from kernel banner.
     
@@ -79,19 +267,33 @@ def parse_kernel_version(banner: str) -> Optional[Tuple[str, LinuxDistro, Option
     "Linux version 5.10.0-28-amd64 (debian-kernel@lists.debian.org)
      (gcc-10 (Debian 10.2.1-6) 10.2.1 20210110, GNU ld (GNU Binutils for Debian) 2.35.2)"
     
+    Example Fedora banner:
+    "Linux version 6.5.6-300.fc39.x86_64 (mockbuild@...) 
+     (gcc (GCC) 13.2.1 20230918 (Red Hat 13.2.1-3)..."
+    
+    Example RHEL/CentOS banner:
+    "Linux version 4.18.0-513.el8.x86_64 (mockbuild@...) 
+     (gcc (GCC) 8.5.0 20210514 (Red Hat 8.5.0-18)..."
+    
     Returns:
-        Tuple of (kernel_version, distro, ubuntu_version, debian_version) or None
+        Dict with kernel_version, distro, and version fields, or None
     """
     if not banner:
         return None
     
     banner_lower = banner.lower()
     
-    # Detect if it's Debian or Ubuntu
+    # Detect distribution
     is_debian = "debian" in banner_lower
     is_ubuntu = "ubuntu" in banner_lower
+    is_fedora = "fedora" in banner_lower or ".fc" in banner_lower
+    is_rhel = "red hat" in banner_lower or ".el" in banner_lower
+    is_centos = "centos" in banner_lower
+    is_rocky = "rocky" in banner_lower
+    is_alma = "alma" in banner_lower
+    is_oracle = "oracle" in banner_lower or ".ol" in banner_lower
     
-    # Extract kernel version - different patterns for Ubuntu vs Debian
+    # Extract kernel version based on detected distro
     kernel_version = None
     
     if is_debian:
@@ -99,68 +301,172 @@ def parse_kernel_version(banner: str) -> Optional[Tuple[str, LinuxDistro, Option
         kernel_match = re.search(r'Linux version (\d+\.\d+\.\d+-\d+-amd64)', banner)
         if not kernel_match:
             kernel_match = re.search(r'(\d+\.\d+\.\d+-\d+-amd64)', banner)
-    else:
+    elif is_ubuntu:
         # Ubuntu pattern: 5.15.0-91-generic
         kernel_match = re.search(r'Linux version (\d+\.\d+\.\d+-\d+-[a-z]+)', banner)
         if not kernel_match:
             kernel_match = re.search(r'(\d+\.\d+\.\d+-\d+-generic)', banner)
+    elif is_fedora:
+        # Fedora pattern: 6.5.6-300.fc39.x86_64
+        kernel_match = re.search(r'Linux version (\d+\.\d+\.\d+-\d+\.fc\d+\.[a-z0-9_]+)', banner)
+        if not kernel_match:
+            kernel_match = re.search(r'(\d+\.\d+\.\d+-\d+\.fc\d+\.[a-z0-9_]+)', banner)
+    elif is_rhel or is_centos or is_rocky or is_alma or is_oracle:
+        # RHEL-based pattern: 4.18.0-513.el8.x86_64, 5.14.0-362.el9.x86_64
+        kernel_match = re.search(r'Linux version (\d+\.\d+\.\d+-[\d.]+\.el\d+[a-z0-9_.]*)', banner)
+        if not kernel_match:
+            kernel_match = re.search(r'(\d+\.\d+\.\d+-[\d.]+\.el\d+[a-z0-9_.]*)', banner)
+        if not kernel_match:
+            # Oracle Linux pattern: 5.15.0-100.96.32.el8uek.x86_64
+            kernel_match = re.search(r'(\d+\.\d+\.\d+-[\d.]+\.el\d+uek[a-z0-9_.]*)', banner)
+    else:
+        # Generic pattern
+        kernel_match = re.search(r'Linux version (\d+\.\d+\.\d+[^\s]*)', banner)
+        if not kernel_match:
+            kernel_match = re.search(r'(\d+\.\d+\.\d+-\d+-[a-z]+)', banner)
     
     if not kernel_match:
         return None
     
     kernel_version = kernel_match.group(1)
     
+    # Build result dict
+    result = {
+        "kernel_version": kernel_version,
+        "distro": None,
+        "ubuntu_version": None,
+        "debian_version": None,
+        "fedora_version": None,
+        "centos_version": None,
+        "rhel_version": None,
+        "oracle_version": None,
+        "rocky_version": None,
+        "alma_version": None,
+    }
+    
     # Determine distro and version
     if is_debian:
-        distro = LinuxDistro.DEBIAN
-        ubuntu_version = None
-        debian_version = None
+        result["distro"] = LinuxDistro.DEBIAN
         
-        # Detect Debian version
         if "buster" in banner_lower or "debian 10" in banner_lower:
-            debian_version = DebianVersion.DEBIAN_10
+            result["debian_version"] = DebianVersion.DEBIAN_10
         elif "bullseye" in banner_lower or "debian 11" in banner_lower:
-            debian_version = DebianVersion.DEBIAN_11
+            result["debian_version"] = DebianVersion.DEBIAN_11
         elif "bookworm" in banner_lower or "debian 12" in banner_lower:
-            debian_version = DebianVersion.DEBIAN_12
+            result["debian_version"] = DebianVersion.DEBIAN_12
         else:
-            # Guess based on kernel version
             major_minor = kernel_version.split('-')[0]
             if major_minor.startswith("4.19."):
-                debian_version = DebianVersion.DEBIAN_10
+                result["debian_version"] = DebianVersion.DEBIAN_10
             elif major_minor.startswith("5.10."):
-                debian_version = DebianVersion.DEBIAN_11
+                result["debian_version"] = DebianVersion.DEBIAN_11
             elif major_minor.startswith("6.1."):
-                debian_version = DebianVersion.DEBIAN_12
-        
-        return kernel_version, distro, None, debian_version
-    else:
-        # Ubuntu
-        distro = LinuxDistro.UBUNTU
-        ubuntu_version = None
+                result["debian_version"] = DebianVersion.DEBIAN_12
+                
+    elif is_ubuntu:
+        result["distro"] = LinuxDistro.UBUNTU
         
         if "~22.04" in banner or "jammy" in banner_lower:
-            ubuntu_version = UbuntuVersion.UBUNTU_22_04
+            result["ubuntu_version"] = UbuntuVersion.UBUNTU_22_04
         elif "~20.04" in banner or "focal" in banner_lower:
-            ubuntu_version = UbuntuVersion.UBUNTU_20_04
+            result["ubuntu_version"] = UbuntuVersion.UBUNTU_20_04
         elif "~24.04" in banner or "noble" in banner_lower:
-            ubuntu_version = UbuntuVersion.UBUNTU_24_04
+            result["ubuntu_version"] = UbuntuVersion.UBUNTU_24_04
         else:
-            # Guess based on kernel version
             major_minor = kernel_version.split('-')[0]
             if major_minor.startswith("5.4."):
-                ubuntu_version = UbuntuVersion.UBUNTU_20_04
+                result["ubuntu_version"] = UbuntuVersion.UBUNTU_20_04
             elif major_minor.startswith("5.15.") or major_minor.startswith("5.19."):
-                ubuntu_version = UbuntuVersion.UBUNTU_22_04
+                result["ubuntu_version"] = UbuntuVersion.UBUNTU_22_04
             elif major_minor.startswith("6."):
-                ubuntu_version = UbuntuVersion.UBUNTU_24_04
+                result["ubuntu_version"] = UbuntuVersion.UBUNTU_24_04
+                
+    elif is_fedora:
+        result["distro"] = LinuxDistro.FEDORA
         
-        return kernel_version, distro, ubuntu_version, None
+        # Extract Fedora version from kernel (e.g., fc39 -> 39)
+        fc_match = re.search(r'\.fc(\d+)\.', kernel_version)
+        if fc_match:
+            fc_ver = fc_match.group(1)
+            if fc_ver == "38":
+                result["fedora_version"] = FedoraVersion.FEDORA_38
+            elif fc_ver == "39":
+                result["fedora_version"] = FedoraVersion.FEDORA_39
+            elif fc_ver == "40":
+                result["fedora_version"] = FedoraVersion.FEDORA_40
+                
+    elif is_centos:
+        result["distro"] = LinuxDistro.CENTOS
+        
+        el_match = re.search(r'\.el(\d+)', kernel_version)
+        if el_match:
+            el_ver = el_match.group(1)
+            if el_ver == "7":
+                result["centos_version"] = CentOSVersion.CENTOS_7
+            elif el_ver == "8":
+                result["centos_version"] = CentOSVersion.CENTOS_8
+            elif el_ver == "9":
+                result["centos_version"] = CentOSVersion.CENTOS_9
+                
+    elif is_rocky:
+        result["distro"] = LinuxDistro.ROCKY
+        
+        el_match = re.search(r'\.el(\d+)', kernel_version)
+        if el_match:
+            el_ver = el_match.group(1)
+            if el_ver == "8":
+                result["rocky_version"] = RockyVersion.ROCKY_8
+            elif el_ver == "9":
+                result["rocky_version"] = RockyVersion.ROCKY_9
+                
+    elif is_alma:
+        result["distro"] = LinuxDistro.ALMA
+        
+        el_match = re.search(r'\.el(\d+)', kernel_version)
+        if el_match:
+            el_ver = el_match.group(1)
+            if el_ver == "8":
+                result["alma_version"] = AlmaVersion.ALMA_8
+            elif el_ver == "9":
+                result["alma_version"] = AlmaVersion.ALMA_9
+                
+    elif is_oracle:
+        result["distro"] = LinuxDistro.ORACLE
+        
+        el_match = re.search(r'\.el(\d+)', kernel_version)
+        if el_match:
+            el_ver = el_match.group(1)
+            if el_ver == "8":
+                result["oracle_version"] = OracleVersion.ORACLE_8
+            elif el_ver == "9":
+                result["oracle_version"] = OracleVersion.ORACLE_9
+                
+    elif is_rhel:
+        result["distro"] = LinuxDistro.RHEL
+        
+        el_match = re.search(r'\.el(\d+)', kernel_version)
+        if el_match:
+            el_ver = el_match.group(1)
+            if el_ver == "8":
+                result["rhel_version"] = RHELVersion.RHEL_8
+            elif el_ver == "9":
+                result["rhel_version"] = RHELVersion.RHEL_9
+                
+    return result
 
 
-def get_symbol_filename(kernel_version: str, distro: LinuxDistro, 
-                        ubuntu_version: Optional[UbuntuVersion] = None,
-                        debian_version: Optional[DebianVersion] = None) -> str:
+def get_symbol_filename(
+    kernel_version: str,
+    distro: LinuxDistro,
+    ubuntu_version: Optional[UbuntuVersion] = None,
+    debian_version: Optional[DebianVersion] = None,
+    fedora_version: Optional[FedoraVersion] = None,
+    centos_version: Optional[CentOSVersion] = None,
+    rhel_version: Optional[RHELVersion] = None,
+    oracle_version: Optional[OracleVersion] = None,
+    rocky_version: Optional[RockyVersion] = None,
+    alma_version: Optional[AlmaVersion] = None,
+) -> str:
     """Generate symbol filename."""
     if distro == LinuxDistro.DEBIAN and debian_version:
         codename = DEBIAN_CODENAMES[debian_version]
@@ -168,16 +474,41 @@ def get_symbol_filename(kernel_version: str, distro: LinuxDistro,
     elif distro == LinuxDistro.UBUNTU and ubuntu_version:
         codename = UBUNTU_CODENAMES[ubuntu_version]
         return f"Ubuntu_{codename}_{kernel_version}.json.xz"
+    elif distro == LinuxDistro.FEDORA and fedora_version:
+        return f"Fedora_{fedora_version.value}_{kernel_version}.json.xz"
+    elif distro == LinuxDistro.CENTOS and centos_version:
+        return f"CentOS_{centos_version.value}_{kernel_version}.json.xz"
+    elif distro == LinuxDistro.RHEL and rhel_version:
+        return f"RHEL_{rhel_version.value}_{kernel_version}.json.xz"
+    elif distro == LinuxDistro.ORACLE and oracle_version:
+        return f"Oracle_{oracle_version.value}_{kernel_version}.json.xz"
+    elif distro == LinuxDistro.ROCKY and rocky_version:
+        return f"Rocky_{rocky_version.value}_{kernel_version}.json.xz"
+    elif distro == LinuxDistro.ALMA and alma_version:
+        return f"Alma_{alma_version.value}_{kernel_version}.json.xz"
     else:
         # Fallback
         return f"Linux_{kernel_version}.json.xz"
 
 
-def check_existing_symbol(kernel_version: str, distro: LinuxDistro,
-                          ubuntu_version: Optional[UbuntuVersion] = None,
-                          debian_version: Optional[DebianVersion] = None) -> Optional[str]:
+def check_existing_symbol(
+    kernel_version: str,
+    distro: LinuxDistro,
+    ubuntu_version: Optional[UbuntuVersion] = None,
+    debian_version: Optional[DebianVersion] = None,
+    fedora_version: Optional[FedoraVersion] = None,
+    centos_version: Optional[CentOSVersion] = None,
+    rhel_version: Optional[RHELVersion] = None,
+    oracle_version: Optional[OracleVersion] = None,
+    rocky_version: Optional[RockyVersion] = None,
+    alma_version: Optional[AlmaVersion] = None,
+) -> Optional[str]:
     """Check if symbol already exists."""
-    filename = get_symbol_filename(kernel_version, distro, ubuntu_version, debian_version)
+    filename = get_symbol_filename(
+        kernel_version, distro, ubuntu_version, debian_version,
+        fedora_version, centos_version, rhel_version, oracle_version,
+        rocky_version, alma_version
+    )
     
     # Check centralized symbols directory
     symbol_path = os.path.join(SYMBOLS_DIR, filename)
@@ -188,11 +519,13 @@ def check_existing_symbol(kernel_version: str, distro: LinuxDistro,
 
 
 class SymbolGenerator:
-    """Handles Docker-based symbol generation."""
+    """Handles Docker-based symbol generation with job queue."""
     
     def __init__(self):
         self.docker_client = None
         self._connect_docker()
+        # Register with job queue
+        job_queue.set_generator(self)
     
     def _connect_docker(self):
         """Connect to Docker daemon."""
@@ -210,10 +543,45 @@ class SymbolGenerator:
             self._connect_docker()
         return self.docker_client is not None
     
+    def get_queue_status(self) -> Dict[str, int]:
+        """Get current queue status."""
+        return {
+            "running": job_queue.running_count,
+            "queued": job_queue.queued_count,
+            "max_concurrent": job_queue.max_concurrent,
+        }
+    
     def _broadcast_job_update(self, job: SymbolGeneration):
-        """Log job update - WebSocket broadcast handled by polling on frontend."""
+        """Broadcast job update via WebSocket for real-time UI updates."""
         status_value = job.status.value if job.status else None
         logger.info(f"[SymGen] Job {job.id} status updated: {status_value}")
+        
+        # Broadcast via WebSocket for live updates
+        ws_manager.broadcast_sync({
+            "type": "job_update",
+            "job": {
+                "id": job.id,
+                "kernel_version": job.kernel_version,
+                "distro": job.distro.value if job.distro else None,
+                "ubuntu_version": job.ubuntu_version.value if job.ubuntu_version else None,
+                "debian_version": job.debian_version.value if job.debian_version else None,
+                "fedora_version": job.fedora_version.value if job.fedora_version else None,
+                "centos_version": job.centos_version.value if job.centos_version else None,
+                "rhel_version": job.rhel_version.value if job.rhel_version else None,
+                "oracle_version": job.oracle_version.value if job.oracle_version else None,
+                "rocky_version": job.rocky_version.value if job.rocky_version else None,
+                "alma_version": job.alma_version.value if job.alma_version else None,
+                "status": status_value,
+                "status_message": job.status_message,
+                "error_message": job.error_message,
+                "symbol_filename": job.symbol_filename,
+                "symbol_file_size": job.symbol_file_size,
+                "download_count": job.download_count,
+                "started_at": job.started_at.isoformat() if job.started_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+            }
+        }, channel="symgen")
     
     def _update_status(self, db: Session, job_id: int, status: SymGenStatus, 
                        message: str = None, error: str = None):
@@ -538,19 +906,342 @@ echo "=== Symbol generation completed successfully ==="
 ls -la "$OUTPUT_DIR"
 '''
 
-    async def generate_symbol(self, job_id: int, kernel_version: str,
-                              distro: LinuxDistro,
-                              ubuntu_version: Optional[UbuntuVersion] = None,
-                              debian_version: Optional[DebianVersion] = None) -> bool:
+    def _generate_fedora_script(self, kernel_version: str, fedora_version: str) -> str:
+        """Generate the shell script to run inside Fedora container."""
+        return f'''#!/bin/bash
+set -e
+
+echo "=== Starting symbol generation for Fedora {fedora_version} kernel {kernel_version} ==="
+
+# Save output directory (the mounted volume)
+OUTPUT_DIR="$PWD"
+
+# Update package lists
+echo ">>> Updating package lists..."
+dnf -y -q update
+
+# Install required packages
+echo ">>> Installing required packages..."
+dnf -y -q install wget xz findutils
+
+# Enable debuginfo repository
+echo ">>> Adding debug repository..."
+dnf -y -q install dnf-plugins-core
+dnf config-manager --set-enabled fedora-debuginfo updates-debuginfo || true
+
+# Install kernel debug symbols
+echo ">>> Installing kernel debug symbols for {kernel_version}..."
+if ! dnf -y -q install kernel-debuginfo-{kernel_version} 2>/dev/null; then
+    # Try with common suffix variants
+    if ! dnf -y -q install kernel-debuginfo-common-x86_64-{kernel_version} kernel-debuginfo-{kernel_version} 2>/dev/null; then
+        echo "ERROR: Could not find/install debug symbols for kernel {kernel_version}"
+        echo ">>> Available debug packages:"
+        dnf search kernel-debuginfo 2>/dev/null | head -20 || true
+        exit 1
+    fi
+fi
+
+# Find vmlinux file (exclude .py/.pyc files and search in kernel module path)
+echo ">>> Looking for vmlinux..."
+VMLINUX=$(find /usr/lib/debug -path "*{kernel_version}*/vmlinux" -type f 2>/dev/null | head -1)
+if [ -z "$VMLINUX" ]; then
+    VMLINUX=$(find /usr/lib/debug -name "vmlinux" -type f 2>/dev/null | grep "{kernel_version}" | head -1)
+fi
+
+if [ -z "$VMLINUX" ] || [ ! -f "$VMLINUX" ]; then
+    echo "ERROR: vmlinux not found in debug package"
+    echo ">>> Searching for vmlinux files..."
+    find /usr/lib/debug -name "vmlinux" -type f 2>/dev/null || true
+    exit 1
+fi
+echo ">>> Found vmlinux: $VMLINUX"
+
+# Download and setup dwarf2json
+echo ">>> Setting up dwarf2json..."
+wget -q https://github.com/volatilityfoundation/dwarf2json/releases/download/v0.8.0/dwarf2json-linux-amd64 -O /usr/local/bin/dwarf2json
+chmod +x /usr/local/bin/dwarf2json
+
+# Check for System.map
+SYSTEM_MAP=""
+if [ -f "/boot/System.map-{kernel_version}" ]; then
+    SYSTEM_MAP="/boot/System.map-{kernel_version}"
+    echo ">>> Found System.map: $SYSTEM_MAP"
+else
+    echo ">>> No System.map found, continuing without it..."
+fi
+
+# Generate symbol file
+echo ">>> Generating Volatility3 symbol file..."
+SYMBOL_FILE="$OUTPUT_DIR/Fedora_{fedora_version}_{kernel_version}.json"
+
+if [ -n "$SYSTEM_MAP" ]; then
+    /usr/local/bin/dwarf2json linux --elf "$VMLINUX" --system-map "$SYSTEM_MAP" > "$SYMBOL_FILE"
+else
+    /usr/local/bin/dwarf2json linux --elf "$VMLINUX" > "$SYMBOL_FILE"
+fi
+
+# Compress the symbol file
+echo ">>> Compressing symbol file..."
+xz -9 "$SYMBOL_FILE"
+
+echo "=== Symbol generation completed successfully ==="
+ls -la "$OUTPUT_DIR"
+'''
+
+    def _generate_rhel_script(self, kernel_version: str, rhel_version: str, distro_name: str = "RHEL") -> str:
+        """Generate the shell script for RHEL-based distros (RHEL, CentOS, Oracle, Rocky, Alma)."""
+        return f'''#!/bin/bash
+set -e
+
+echo "=== Starting symbol generation for {distro_name} {rhel_version} kernel {kernel_version} ==="
+
+# Save output directory (the mounted volume)
+OUTPUT_DIR="$PWD"
+
+# Update package lists
+echo ">>> Updating package lists..."
+yum -y -q update 2>/dev/null || dnf -y -q update
+
+# Install required packages
+echo ">>> Installing required packages..."
+yum -y -q install wget xz findutils 2>/dev/null || dnf -y -q install wget xz findutils
+
+# Enable debuginfo repository
+echo ">>> Adding debug repository..."
+yum -y -q install yum-utils 2>/dev/null || dnf -y -q install dnf-plugins-core
+debuginfo-install -y kernel-{kernel_version} 2>/dev/null || true
+
+# Alternative: try to install kernel-debuginfo directly
+echo ">>> Installing kernel debug symbols for {kernel_version}..."
+if ! yum -y -q install kernel-debuginfo-{kernel_version} 2>/dev/null; then
+    if ! dnf -y -q install kernel-debuginfo-{kernel_version} 2>/dev/null; then
+        # Try common package
+        yum -y -q install kernel-debuginfo-common-x86_64-{kernel_version} kernel-debuginfo-{kernel_version} 2>/dev/null || \
+        dnf -y -q install kernel-debuginfo-common-x86_64-{kernel_version} kernel-debuginfo-{kernel_version} 2>/dev/null || true
+    fi
+fi
+
+# Find vmlinux file
+echo ">>> Looking for vmlinux..."
+VMLINUX=$(find /usr/lib/debug -name "vmlinux-{kernel_version}*" -type f 2>/dev/null | head -1)
+if [ -z "$VMLINUX" ]; then
+    VMLINUX=$(find /usr/lib/debug -name "vmlinux*" -path "*{kernel_version}*" -type f 2>/dev/null | head -1)
+fi
+
+if [ -z "$VMLINUX" ] || [ ! -f "$VMLINUX" ]; then
+    echo "ERROR: vmlinux not found in debug package"
+    echo ">>> Searching for any vmlinux files..."
+    find /usr/lib/debug -name "vmlinux*" -type f 2>/dev/null || true
+    exit 1
+fi
+echo ">>> Found vmlinux: $VMLINUX"
+
+# Download and setup dwarf2json
+echo ">>> Setting up dwarf2json..."
+wget -q https://github.com/volatilityfoundation/dwarf2json/releases/download/v0.8.0/dwarf2json-linux-amd64 -O /usr/local/bin/dwarf2json
+chmod +x /usr/local/bin/dwarf2json
+
+# Check for System.map
+SYSTEM_MAP=""
+if [ -f "/boot/System.map-{kernel_version}" ]; then
+    SYSTEM_MAP="/boot/System.map-{kernel_version}"
+    echo ">>> Found System.map: $SYSTEM_MAP"
+else
+    echo ">>> No System.map found, continuing without it..."
+fi
+
+# Generate symbol file
+echo ">>> Generating Volatility3 symbol file..."
+SYMBOL_FILE="$OUTPUT_DIR/{distro_name}_{rhel_version}_{kernel_version}.json"
+
+if [ -n "$SYSTEM_MAP" ]; then
+    /usr/local/bin/dwarf2json linux --elf "$VMLINUX" --system-map "$SYSTEM_MAP" > "$SYMBOL_FILE"
+else
+    /usr/local/bin/dwarf2json linux --elf "$VMLINUX" > "$SYMBOL_FILE"
+fi
+
+# Compress the symbol file
+echo ">>> Compressing symbol file..."
+xz -9 "$SYMBOL_FILE"
+
+echo "=== Symbol generation completed successfully ==="
+ls -la "$OUTPUT_DIR"
+'''
+
+    def _generate_oracle_script(self, kernel_version: str, oracle_version: str) -> str:
+        """Generate the shell script for Oracle Linux with proper debuginfo repos."""
+        # Determine repo suffix based on version
+        repo_suffix = oracle_version  # e.g., "8" or "9"
+        
+        return f'''#!/bin/bash
+set -e
+
+echo "=== Starting symbol generation for Oracle Linux {oracle_version} kernel {kernel_version} ==="
+
+# Save output directory (the mounted volume)
+OUTPUT_DIR="$PWD"
+
+# Update package lists
+echo ">>> Updating package lists..."
+dnf -y -q makecache
+
+# Install required packages
+echo ">>> Installing required packages..."
+dnf -y -q install wget xz findutils dnf-plugins-core
+
+# Add Oracle Linux debuginfo repository from oss.oracle.com (correct location)
+echo ">>> Adding Oracle Linux debuginfo repository..."
+cat > /etc/yum.repos.d/ol_debuginfo.repo << 'REPOEOF'
+[ol_debuginfo]
+name=Oracle Linux {oracle_version} Debuginfo
+baseurl=https://oss.oracle.com/ol{repo_suffix}/debuginfo/
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-oracle
+gpgcheck=1
+enabled=1
+REPOEOF
+
+# Refresh metadata with new repos
+echo ">>> Refreshing repository metadata..."
+dnf -y makecache 2>&1 | tail -5
+
+# List available debuginfo repos
+echo ">>> Available debuginfo repos:"
+dnf repolist | grep -i debug || true
+
+# Try to install kernel debug symbols
+echo ">>> Installing kernel debug symbols for {kernel_version}..."
+
+# Detect kernel type and install appropriate debuginfo
+if echo "{kernel_version}" | grep -q "uek"; then
+    echo ">>> Detected UEK kernel..."
+    dnf -y install kernel-uek-debuginfo-{kernel_version} 2>&1 | tail -10 || true
+else
+    echo ">>> Detected RHCK kernel..."
+    dnf -y install kernel-debuginfo-{kernel_version} kernel-debuginfo-common-x86_64-{kernel_version} 2>&1 | tail -10 || true
+fi
+
+# Find vmlinux file
+echo ">>> Looking for vmlinux..."
+VMLINUX=$(find /usr/lib/debug -name "vmlinux-{kernel_version}*" -type f 2>/dev/null | head -1)
+if [ -z "$VMLINUX" ]; then
+    VMLINUX=$(find /usr/lib/debug -name "vmlinux*" -path "*{kernel_version}*" -type f 2>/dev/null | head -1)
+fi
+
+if [ -z "$VMLINUX" ] || [ ! -f "$VMLINUX" ]; then
+    echo "ERROR: vmlinux not found in debug package"
+    echo ">>> Searching for any vmlinux files..."
+    find /usr/lib/debug -name "vmlinux*" -type f 2>/dev/null || true
+    echo ">>> Listing installed debuginfo packages..."
+    rpm -qa | grep -i debuginfo || true
+    exit 1
+fi
+echo ">>> Found vmlinux: $VMLINUX"
+
+# Download and setup dwarf2json
+echo ">>> Setting up dwarf2json..."
+wget -q https://github.com/volatilityfoundation/dwarf2json/releases/download/v0.8.0/dwarf2json-linux-amd64 -O /usr/local/bin/dwarf2json
+chmod +x /usr/local/bin/dwarf2json
+
+# Check for System.map
+SYSTEM_MAP=""
+if [ -f "/boot/System.map-{kernel_version}" ]; then
+    SYSTEM_MAP="/boot/System.map-{kernel_version}"
+    echo ">>> Found System.map: $SYSTEM_MAP"
+else
+    echo ">>> No System.map found, continuing without it..."
+fi
+
+# Generate symbol file
+echo ">>> Generating Volatility3 symbol file..."
+SYMBOL_FILE="$OUTPUT_DIR/Oracle_{oracle_version}_{kernel_version}.json"
+
+if [ -n "$SYSTEM_MAP" ]; then
+    /usr/local/bin/dwarf2json linux --elf "$VMLINUX" --system-map "$SYSTEM_MAP" > "$SYMBOL_FILE"
+else
+    /usr/local/bin/dwarf2json linux --elf "$VMLINUX" > "$SYMBOL_FILE"
+fi
+
+# Compress the symbol file
+echo ">>> Compressing symbol file..."
+xz -9 "$SYMBOL_FILE"
+
+echo "=== Symbol generation completed successfully ==="
+ls -la "$OUTPUT_DIR"
+'''
+
+    async def generate_symbol(
+        self,
+        job_id: int,
+        kernel_version: str,
+        distro: LinuxDistro,
+        ubuntu_version: Optional[UbuntuVersion] = None,
+        debian_version: Optional[DebianVersion] = None,
+        fedora_version: Optional[FedoraVersion] = None,
+        centos_version: Optional[CentOSVersion] = None,
+        rhel_version: Optional[RHELVersion] = None,
+        oracle_version: Optional[OracleVersion] = None,
+        rocky_version: Optional[RockyVersion] = None,
+        alma_version: Optional[AlmaVersion] = None,
+    ) -> bool:
         """
-        Generate a Volatility3 symbol file using Docker.
+        Submit a symbol generation job to the queue.
+        
+        Jobs are queued and only MAX_CONCURRENT_JOBS run at a time.
         
         Args:
             job_id: Database ID of the SymbolGeneration job
             kernel_version: Kernel version (e.g., "5.15.0-91-generic" or "5.10.0-28-amd64")
-            distro: Linux distribution (Ubuntu or Debian)
-            ubuntu_version: Ubuntu version enum (if distro is Ubuntu)
-            debian_version: Debian version enum (if distro is Debian)
+            distro: Linux distribution
+            *_version: Version enum for the specific distro
+            
+        Returns:
+            True if job was submitted successfully
+        """
+        # Submit to job queue
+        started = await job_queue.submit_job(
+            job_id,
+            kernel_version,
+            distro,
+            ubuntu_version,
+            debian_version,
+            fedora_version,
+            centos_version,
+            rhel_version,
+            oracle_version,
+            rocky_version,
+            alma_version,
+        )
+        
+        if started:
+            logger.info(f"Job {job_id} started immediately")
+        else:
+            logger.info(f"Job {job_id} added to queue (position {job_queue.get_queue_position(job_id)})")
+        
+        return True
+    
+    async def _execute_generation(
+        self,
+        job_id: int,
+        kernel_version: str,
+        distro: LinuxDistro,
+        ubuntu_version: Optional[UbuntuVersion] = None,
+        debian_version: Optional[DebianVersion] = None,
+        fedora_version: Optional[FedoraVersion] = None,
+        centos_version: Optional[CentOSVersion] = None,
+        rhel_version: Optional[RHELVersion] = None,
+        oracle_version: Optional[OracleVersion] = None,
+        rocky_version: Optional[RockyVersion] = None,
+        alma_version: Optional[AlmaVersion] = None,
+    ) -> bool:
+        """
+        Actually execute the symbol generation in Docker.
+        This is called by the JobQueue when the job is ready to run.
+        
+        Args:
+            job_id: Database ID of the SymbolGeneration job
+            kernel_version: Kernel version (e.g., "5.15.0-91-generic" or "5.10.0-28-amd64")
+            distro: Linux distribution
+            *_version: Version enum for the specific distro
             
         Returns:
             True if successful, False otherwise
@@ -566,22 +1257,54 @@ ls -la "$OUTPUT_DIR"
                                   error="Docker is not available")
                 return False
             
-            # Get image and codename based on distro
+            # Get image and script based on distro
+            image = None
+            script = None
+            
             if distro == LinuxDistro.DEBIAN and debian_version:
                 image = DEBIAN_IMAGES[debian_version]
                 codename = DEBIAN_CODENAMES[debian_version]
+                script = self._generate_debian_script(kernel_version, codename)
             elif distro == LinuxDistro.UBUNTU and ubuntu_version:
                 image = UBUNTU_IMAGES[ubuntu_version]
                 codename = UBUNTU_CODENAMES[ubuntu_version]
-            else:
+                script = self._generate_ubuntu_script(kernel_version, codename)
+            elif distro == LinuxDistro.FEDORA and fedora_version:
+                image = FEDORA_IMAGES[fedora_version]
+                script = self._generate_fedora_script(kernel_version, fedora_version.value)
+            elif distro == LinuxDistro.CENTOS and centos_version:
+                image = CENTOS_IMAGES[centos_version]
+                script = self._generate_rhel_script(kernel_version, centos_version.value, "CentOS")
+            elif distro == LinuxDistro.RHEL and rhel_version:
+                image = RHEL_IMAGES[rhel_version]
+                script = self._generate_rhel_script(kernel_version, rhel_version.value, "RHEL")
+            elif distro == LinuxDistro.ORACLE and oracle_version:
+                image = ORACLE_IMAGES[oracle_version]
+                script = self._generate_oracle_script(kernel_version, oracle_version.value)
+            elif distro == LinuxDistro.ROCKY and rocky_version:
+                image = ROCKY_IMAGES[rocky_version]
+                script = self._generate_rhel_script(kernel_version, rocky_version.value, "Rocky")
+            elif distro == LinuxDistro.ALMA and alma_version:
+                image = ALMA_IMAGES[alma_version]
+                script = self._generate_rhel_script(kernel_version, alma_version.value, "Alma")
+            
+            if not image or not script:
                 self._update_status(db, job_id, SymGenStatus.FAILED,
                                   error="Invalid distro configuration")
                 return False
             
-            symbol_filename = get_symbol_filename(kernel_version, distro, ubuntu_version, debian_version)
+            symbol_filename = get_symbol_filename(
+                kernel_version, distro, ubuntu_version, debian_version,
+                fedora_version, centos_version, rhel_version, oracle_version,
+                rocky_version, alma_version
+            )
             
             # Check if symbol already exists
-            existing = check_existing_symbol(kernel_version, distro, ubuntu_version, debian_version)
+            existing = check_existing_symbol(
+                kernel_version, distro, ubuntu_version, debian_version,
+                fedora_version, centos_version, rhel_version, oracle_version,
+                rocky_version, alma_version
+            )
             if existing:
                 logger.info(f"Symbol already exists: {existing}")
                 job = db.query(SymbolGeneration).filter(SymbolGeneration.id == job_id).first()
@@ -616,12 +1339,7 @@ ls -la "$OUTPUT_DIR"
             output_dir = os.path.join(UPLOAD_DIR, temp_subdir)
             os.makedirs(output_dir, exist_ok=True)
             
-            # Generate script in the output directory based on distro
-            if distro == LinuxDistro.DEBIAN:
-                script = self._generate_debian_script(kernel_version, codename)
-            else:
-                script = self._generate_ubuntu_script(kernel_version, codename)
-            
+            # Script was already generated above based on distro
             script_path = os.path.join(output_dir, "generate.sh")
             with open(script_path, 'w') as f:
                 f.write(script)
@@ -727,6 +1445,12 @@ ls -la "$OUTPUT_DIR"
             
             db.close()
     
+    async def cancel_job_async(self, job_id: int) -> bool:
+        """Cancel a job (async version for queue cancellation)."""
+        # Try to cancel from queue first
+        await job_queue.cancel_job(job_id)
+        return self.cancel_job(job_id)
+    
     def cancel_job(self, job_id: int) -> bool:
         """Cancel a running symbol generation job."""
         db = SessionLocal()
@@ -734,6 +1458,12 @@ ls -la "$OUTPUT_DIR"
             job = db.query(SymbolGeneration).filter(SymbolGeneration.id == job_id).first()
             if not job:
                 return False
+            
+            # Try to cancel from queue (sync version - checks if queued)
+            queue_pos = job_queue.get_queue_position(job_id)
+            if queue_pos:
+                # Job is queued, will be removed by async cancel
+                logger.info(f"Job {job_id} is queued at position {queue_pos}, marking as cancelled")
             
             if job.container_id and self.is_available():
                 try:

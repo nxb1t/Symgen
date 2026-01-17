@@ -14,7 +14,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy import desc
 
 from app.database import get_db
-from app.models import SymbolGeneration, SymGenStatus, UbuntuVersion, DebianVersion, LinuxDistro
+from app.models import (
+    SymbolGeneration, SymGenStatus, LinuxDistro,
+    UbuntuVersion, DebianVersion, FedoraVersion, CentOSVersion,
+    RHELVersion, OracleVersion, RockyVersion, AlmaVersion
+)
 from app.schemas import (
     SymGenCreate, SymGenResponse, SymGenListResponse, 
     GeneratedSymbolResponse, SymbolPortalResponse, KernelParseResponse,
@@ -36,10 +40,12 @@ router = APIRouter(prefix="/api/symgen", tags=["symgen"])
 @router.get("/status")
 def get_symgen_status():
     """Check if symbol generation is available (Docker connected)."""
+    queue_status = symbol_generator.get_queue_status()
     return {
         "available": symbol_generator.is_available(),
         "message": "Docker is connected" if symbol_generator.is_available() 
-                   else "Docker is not available. Make sure Docker socket is mounted."
+                   else "Docker is not available. Make sure Docker socket is mounted.",
+        "queue": queue_status,
     }
 
 
@@ -165,15 +171,22 @@ async def create_symbol_generation(
         )
     
     # Validate distro-specific version is provided
-    if request.distro == LinuxDistro.UBUNTU and not request.ubuntu_version:
+    version_requirements = {
+        LinuxDistro.UBUNTU: ("ubuntu_version", request.ubuntu_version),
+        LinuxDistro.DEBIAN: ("debian_version", request.debian_version),
+        LinuxDistro.FEDORA: ("fedora_version", request.fedora_version),
+        LinuxDistro.CENTOS: ("centos_version", request.centos_version),
+        LinuxDistro.RHEL: ("rhel_version", request.rhel_version),
+        LinuxDistro.ORACLE: ("oracle_version", request.oracle_version),
+        LinuxDistro.ROCKY: ("rocky_version", request.rocky_version),
+        LinuxDistro.ALMA: ("alma_version", request.alma_version),
+    }
+    
+    version_field, version_value = version_requirements.get(request.distro, (None, None))
+    if version_field and not version_value:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="ubuntu_version is required when distro is Ubuntu"
-        )
-    if request.distro == LinuxDistro.DEBIAN and not request.debian_version:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="debian_version is required when distro is Debian"
+            detail=f"{version_field} is required when distro is {request.distro.value.capitalize()}"
         )
     
     # Build base query for this kernel+distro+version combination
@@ -182,10 +195,20 @@ async def create_symbol_generation(
             SymbolGeneration.kernel_version == request.kernel_version,
             SymbolGeneration.distro == request.distro
         )
-        if request.distro == LinuxDistro.UBUNTU:
-            query = query.filter(SymbolGeneration.ubuntu_version == request.ubuntu_version)
-        else:
-            query = query.filter(SymbolGeneration.debian_version == request.debian_version)
+        # Filter by the appropriate version field
+        version_filters = {
+            LinuxDistro.UBUNTU: (SymbolGeneration.ubuntu_version, request.ubuntu_version),
+            LinuxDistro.DEBIAN: (SymbolGeneration.debian_version, request.debian_version),
+            LinuxDistro.FEDORA: (SymbolGeneration.fedora_version, request.fedora_version),
+            LinuxDistro.CENTOS: (SymbolGeneration.centos_version, request.centos_version),
+            LinuxDistro.RHEL: (SymbolGeneration.rhel_version, request.rhel_version),
+            LinuxDistro.ORACLE: (SymbolGeneration.oracle_version, request.oracle_version),
+            LinuxDistro.ROCKY: (SymbolGeneration.rocky_version, request.rocky_version),
+            LinuxDistro.ALMA: (SymbolGeneration.alma_version, request.alma_version),
+        }
+        version_field, version_value = version_filters.get(request.distro, (None, None))
+        if version_field is not None:
+            query = query.filter(version_field == version_value)
         return query
     
     # Check for existing completed job
@@ -223,6 +246,12 @@ async def create_symbol_generation(
         distro=request.distro,
         ubuntu_version=request.ubuntu_version,
         debian_version=request.debian_version,
+        fedora_version=request.fedora_version,
+        centos_version=request.centos_version,
+        rhel_version=request.rhel_version,
+        oracle_version=request.oracle_version,
+        rocky_version=request.rocky_version,
+        alma_version=request.alma_version,
         status=SymGenStatus.PENDING,
         status_message="Job created, waiting to start...",
     )
@@ -239,6 +268,12 @@ async def create_symbol_generation(
             "distro": job.distro.value if job.distro else None,
             "ubuntu_version": job.ubuntu_version.value if job.ubuntu_version else None,
             "debian_version": job.debian_version.value if job.debian_version else None,
+            "fedora_version": job.fedora_version.value if job.fedora_version else None,
+            "centos_version": job.centos_version.value if job.centos_version else None,
+            "rhel_version": job.rhel_version.value if job.rhel_version else None,
+            "oracle_version": job.oracle_version.value if job.oracle_version else None,
+            "rocky_version": job.rocky_version.value if job.rocky_version else None,
+            "alma_version": job.alma_version.value if job.alma_version else None,
             "status": job.status.value if job.status else None,
             "status_message": job.status_message,
             "error_message": job.error_message,
@@ -258,7 +293,13 @@ async def create_symbol_generation(
         request.kernel_version,
         request.distro,
         request.ubuntu_version,
-        request.debian_version
+        request.debian_version,
+        request.fedora_version,
+        request.centos_version,
+        request.rhel_version,
+        request.oracle_version,
+        request.rocky_version,
+        request.alma_version,
     )
     
     return job
@@ -283,13 +324,17 @@ def parse_kernel_banner(banner: str):
             message="Could not parse kernel version from banner"
         )
     
-    kernel_version, distro, ubuntu_version, debian_version = parsed
-    
     return KernelParseResponse(
-        kernel_version=kernel_version,
-        distro=distro,
-        ubuntu_version=ubuntu_version,
-        debian_version=debian_version,
+        kernel_version=parsed.get("kernel_version"),
+        distro=parsed.get("distro"),
+        ubuntu_version=parsed.get("ubuntu_version"),
+        debian_version=parsed.get("debian_version"),
+        fedora_version=parsed.get("fedora_version"),
+        centos_version=parsed.get("centos_version"),
+        rhel_version=parsed.get("rhel_version"),
+        oracle_version=parsed.get("oracle_version"),
+        rocky_version=parsed.get("rocky_version"),
+        alma_version=parsed.get("alma_version"),
         success=True,
         message="Successfully parsed kernel information"
     )
@@ -299,14 +344,41 @@ def parse_kernel_banner(banner: str):
 def list_generation_jobs(
     page: int = 1,
     page_size: int = 10,
-    status_filter: Optional[SymGenStatus] = None,
+    status_filter: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """List all symbol generation jobs with pagination."""
+    """
+    List all symbol generation jobs with pagination.
+    
+    status_filter can be:
+    - 'completed' - only completed jobs
+    - 'failed' - only failed jobs  
+    - 'in_progress' - pending, pulling_image, running, downloading_kernel, generating_symbol
+    - A specific SymGenStatus value
+    """
     query = db.query(SymbolGeneration)
     
     if status_filter:
-        query = query.filter(SymbolGeneration.status == status_filter)
+        if status_filter == "in_progress":
+            # Filter for all in-progress statuses
+            query = query.filter(SymbolGeneration.status.in_([
+                SymGenStatus.PENDING,
+                SymGenStatus.PULLING_IMAGE,
+                SymGenStatus.RUNNING,
+                SymGenStatus.DOWNLOADING_KERNEL,
+                SymGenStatus.GENERATING_SYMBOL
+            ]))
+        elif status_filter == "completed":
+            query = query.filter(SymbolGeneration.status == SymGenStatus.COMPLETED)
+        elif status_filter == "failed":
+            query = query.filter(SymbolGeneration.status == SymGenStatus.FAILED)
+        else:
+            # Try to match a specific status
+            try:
+                status_enum = SymGenStatus(status_filter)
+                query = query.filter(SymbolGeneration.status == status_enum)
+            except ValueError:
+                pass  # Invalid status, ignore filter
     
     total = query.count()
     total_pages = math.ceil(total / page_size) if total > 0 else 1
@@ -445,6 +517,12 @@ def list_available_symbols(
             distro=s.distro or LinuxDistro.UBUNTU,
             ubuntu_version=s.ubuntu_version,
             debian_version=s.debian_version,
+            fedora_version=s.fedora_version,
+            centos_version=s.centos_version,
+            rhel_version=s.rhel_version,
+            oracle_version=s.oracle_version,
+            rocky_version=s.rocky_version,
+            alma_version=s.alma_version,
             symbol_filename=s.symbol_filename,
             symbol_file_size=s.symbol_file_size or 0,
             download_count=s.download_count,
@@ -507,7 +585,7 @@ def get_supported_distros():
     """Get list of supported Linux distributions and their versions."""
     return {
         "distros": [
-            {"value": d.value, "label": d.value.capitalize()}
+            {"value": d.value, "label": _get_distro_label(d)}
             for d in LinuxDistro
         ],
         "ubuntu_versions": [
@@ -517,8 +595,47 @@ def get_supported_distros():
         "debian_versions": [
             {"value": v.value, "label": f"Debian {v.value} ({_get_debian_codename(v)})"}
             for v in DebianVersion
-        ]
+        ],
+        "fedora_versions": [
+            {"value": v.value, "label": f"Fedora {v.value}"}
+            for v in FedoraVersion
+        ],
+        "centos_versions": [
+            {"value": v.value, "label": _get_centos_label(v)}
+            for v in CentOSVersion
+        ],
+        "rhel_versions": [
+            {"value": v.value, "label": f"RHEL {v.value}"}
+            for v in RHELVersion
+        ],
+        "oracle_versions": [
+            {"value": v.value, "label": f"Oracle Linux {v.value}"}
+            for v in OracleVersion
+        ],
+        "rocky_versions": [
+            {"value": v.value, "label": f"Rocky Linux {v.value}"}
+            for v in RockyVersion
+        ],
+        "alma_versions": [
+            {"value": v.value, "label": f"AlmaLinux {v.value}"}
+            for v in AlmaVersion
+        ],
     }
+
+
+def _get_distro_label(distro: LinuxDistro) -> str:
+    """Get human-readable distro label."""
+    labels = {
+        LinuxDistro.UBUNTU: "Ubuntu",
+        LinuxDistro.DEBIAN: "Debian",
+        LinuxDistro.FEDORA: "Fedora",
+        LinuxDistro.CENTOS: "CentOS",
+        LinuxDistro.RHEL: "Red Hat Enterprise Linux",
+        LinuxDistro.ORACLE: "Oracle Linux",
+        LinuxDistro.ROCKY: "Rocky Linux",
+        LinuxDistro.ALMA: "AlmaLinux",
+    }
+    return labels.get(distro, distro.value.capitalize())
 
 
 def _get_debian_codename(version: DebianVersion) -> str:
@@ -529,6 +646,16 @@ def _get_debian_codename(version: DebianVersion) -> str:
         DebianVersion.DEBIAN_12: "Bookworm",
     }
     return codenames.get(version, "")
+
+
+def _get_centos_label(version: CentOSVersion) -> str:
+    """Get CentOS version label."""
+    labels = {
+        CentOSVersion.CENTOS_7: "CentOS 7",
+        CentOSVersion.CENTOS_8: "CentOS Stream 8",
+        CentOSVersion.CENTOS_9: "CentOS Stream 9",
+    }
+    return labels.get(version, f"CentOS {version.value}")
 
 
 @router.get("/ubuntu-versions")

@@ -1,0 +1,47 @@
+[package]
+name = "symgen"
+version = "0.1.0"
+edition = "2021"
+authors = ["nxb1t"]
+description = "Volatility3 Linux Symbol Generator CLI"
+license = "MIT"
+repository = "https://github.com/nxb1t/Symgen"
+keywords = ["volatility", "forensics", "linux", "symbols", "memory"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive", "env", "color"] }
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# Docker client
+bollard = "0.18"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Terminal output
+colored = "2.2"
+indicatif = "0.17"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+futures = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4"] }
+regex = "1.11"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

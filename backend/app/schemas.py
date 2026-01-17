@@ -1,7 +1,11 @@
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional, List
-from app.models import SymGenStatus, UbuntuVersion, DebianVersion, LinuxDistro
+from app.models import (
+    SymGenStatus, LinuxDistro,
+    UbuntuVersion, DebianVersion, FedoraVersion, CentOSVersion,
+    RHELVersion, OracleVersion, RockyVersion, AlmaVersion
+)
 
 
 # ============================================================
@@ -14,6 +18,12 @@ class SymGenCreate(BaseModel):
     distro: LinuxDistro = LinuxDistro.UBUNTU
     ubuntu_version: Optional[UbuntuVersion] = None
     debian_version: Optional[DebianVersion] = None
+    fedora_version: Optional[FedoraVersion] = None
+    centos_version: Optional[CentOSVersion] = None
+    rhel_version: Optional[RHELVersion] = None
+    oracle_version: Optional[OracleVersion] = None
+    rocky_version: Optional[RockyVersion] = None
+    alma_version: Optional[AlmaVersion] = None
 
 
 class SymGenResponse(BaseModel):
@@ -23,6 +33,12 @@ class SymGenResponse(BaseModel):
     distro: LinuxDistro = LinuxDistro.UBUNTU
     ubuntu_version: Optional[UbuntuVersion] = None
     debian_version: Optional[DebianVersion] = None
+    fedora_version: Optional[FedoraVersion] = None
+    centos_version: Optional[CentOSVersion] = None
+    rhel_version: Optional[RHELVersion] = None
+    oracle_version: Optional[OracleVersion] = None
+    rocky_version: Optional[RockyVersion] = None
+    alma_version: Optional[AlmaVersion] = None
     status: SymGenStatus
     status_message: Optional[str] = None
     error_message: Optional[str] = None
@@ -53,6 +69,12 @@ class GeneratedSymbolResponse(BaseModel):
     distro: LinuxDistro = LinuxDistro.UBUNTU
     ubuntu_version: Optional[UbuntuVersion] = None
     debian_version: Optional[DebianVersion] = None
+    fedora_version: Optional[FedoraVersion] = None
+    centos_version: Optional[CentOSVersion] = None
+    rhel_version: Optional[RHELVersion] = None
+    oracle_version: Optional[OracleVersion] = None
+    rocky_version: Optional[RockyVersion] = None
+    alma_version: Optional[AlmaVersion] = None
     symbol_filename: str
     symbol_file_size: int
     download_count: int
@@ -77,6 +99,12 @@ class KernelParseResponse(BaseModel):
     distro: Optional[LinuxDistro] = None
     ubuntu_version: Optional[UbuntuVersion] = None
     debian_version: Optional[DebianVersion] = None
+    fedora_version: Optional[FedoraVersion] = None
+    centos_version: Optional[CentOSVersion] = None
+    rhel_version: Optional[RHELVersion] = None
+    oracle_version: Optional[OracleVersion] = None
+    rocky_version: Optional[RockyVersion] = None
+    alma_version: Optional[AlmaVersion] = None
     success: bool
     message: str
 

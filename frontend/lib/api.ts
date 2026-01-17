@@ -11,9 +11,16 @@ const api = axios.create({
 });
 
 export type SymGenStatus = "pending" | "pulling_image" | "running" | "downloading_kernel" | "generating_symbol" | "completed" | "failed";
-export type LinuxDistro = "ubuntu" | "debian";
+export type LinuxDistro = "ubuntu" | "debian" | "fedora" | "centos" | "rhel" | "oracle" | "rocky" | "alma";
 export type UbuntuVersion = "20.04" | "22.04" | "24.04";
 export type DebianVersion = "10" | "11" | "12";
+export type FedoraVersion = "38" | "39" | "40";
+export type CentOSVersion = "7" | "8" | "9";
+export type RHELVersion = "8" | "9";
+export type OracleVersion = "8" | "9";
+export type RockyVersion = "8" | "9";
+export type AlmaVersion = "8" | "9";
+
 
 // Symbol Generation Types
 export interface SymGenJob {
@@ -22,6 +29,12 @@ export interface SymGenJob {
   distro: LinuxDistro;
   ubuntu_version?: UbuntuVersion | null;
   debian_version?: DebianVersion | null;
+  fedora_version?: FedoraVersion | null;
+  centos_version?: CentOSVersion | null;
+  rhel_version?: RHELVersion | null;
+  oracle_version?: OracleVersion | null;
+  rocky_version?: RockyVersion | null;
+  alma_version?: AlmaVersion | null;
   status: SymGenStatus;
   status_message?: string | null;
   error_message?: string | null;
@@ -47,6 +60,12 @@ export interface GeneratedSymbol {
   distro: LinuxDistro;
   ubuntu_version?: UbuntuVersion | null;
   debian_version?: DebianVersion | null;
+  fedora_version?: FedoraVersion | null;
+  centos_version?: CentOSVersion | null;
+  rhel_version?: RHELVersion | null;
+  oracle_version?: OracleVersion | null;
+  rocky_version?: RockyVersion | null;
+  alma_version?: AlmaVersion | null;
   symbol_filename: string;
   symbol_file_size: number;
   download_count: number;
@@ -66,6 +85,12 @@ export interface KernelParseResponse {
   distro?: LinuxDistro | null;
   ubuntu_version?: UbuntuVersion | null;
   debian_version?: DebianVersion | null;
+  fedora_version?: FedoraVersion | null;
+  centos_version?: CentOSVersion | null;
+  rhel_version?: RHELVersion | null;
+  oracle_version?: OracleVersion | null;
+  rocky_version?: RockyVersion | null;
+  alma_version?: AlmaVersion | null;
   success: boolean;
   message: string;
 }
@@ -80,6 +105,36 @@ export interface DebianVersionOption {
   label: string;
 }
 
+export interface FedoraVersionOption {
+  value: FedoraVersion;
+  label: string;
+}
+
+export interface CentOSVersionOption {
+  value: CentOSVersion;
+  label: string;
+}
+
+export interface RHELVersionOption {
+  value: RHELVersion;
+  label: string;
+}
+
+export interface OracleVersionOption {
+  value: OracleVersion;
+  label: string;
+}
+
+export interface RockyVersionOption {
+  value: RockyVersion;
+  label: string;
+}
+
+export interface AlmaVersionOption {
+  value: AlmaVersion;
+  label: string;
+}
+
 export interface DistroOption {
   value: LinuxDistro;
   label: string;
@@ -89,6 +144,12 @@ export interface DistrosResponse {
   distros: DistroOption[];
   ubuntu_versions: UbuntuVersionOption[];
   debian_versions: DebianVersionOption[];
+  fedora_versions: FedoraVersionOption[];
+  centos_versions: CentOSVersionOption[];
+  rhel_versions: RHELVersionOption[];
+  oracle_versions: OracleVersionOption[];
+  rocky_versions: RockyVersionOption[];
+  alma_versions: AlmaVersionOption[];
 }
 
 export interface MetricsResponse {
@@ -106,11 +167,18 @@ export interface MetricsResponse {
   slowest_job_seconds: number | null;
 }
 
+// Queue status type
+export interface QueueStatus {
+  running: number;
+  queued: number;
+  max_concurrent: number;
+}
+
 // Symbol Generation API
 export const symgenApi = {
   // Check if Docker/symgen is available
-  getStatus: async (): Promise<{ available: boolean; message: string }> => {
-    const response = await api.get<{ available: boolean; message: string }>("/api/symgen/status");
+  getStatus: async (): Promise<{ available: boolean; message: string; queue: QueueStatus }> => {
+    const response = await api.get<{ available: boolean; message: string; queue: QueueStatus }>("/api/symgen/status");
     return response.data;
   },
 
@@ -142,20 +210,35 @@ export const symgenApi = {
   generate: async (
     kernelVersion: string,
     distro: LinuxDistro,
-    ubuntuVersion?: UbuntuVersion,
-    debianVersion?: DebianVersion
+    options?: {
+      ubuntuVersion?: UbuntuVersion;
+      debianVersion?: DebianVersion;
+      fedoraVersion?: FedoraVersion;
+      centosVersion?: CentOSVersion;
+      rhelVersion?: RHELVersion;
+      oracleVersion?: OracleVersion;
+      rockyVersion?: RockyVersion;
+      almaVersion?: AlmaVersion;
+    }
   ): Promise<SymGenJob> => {
     const response = await api.post<SymGenJob>("/api/symgen/generate", {
       kernel_version: kernelVersion,
       distro: distro,
-      ubuntu_version: ubuntuVersion || null,
-      debian_version: debianVersion || null,
+      ubuntu_version: options?.ubuntuVersion || null,
+      debian_version: options?.debianVersion || null,
+      fedora_version: options?.fedoraVersion || null,
+      centos_version: options?.centosVersion || null,
+      rhel_version: options?.rhelVersion || null,
+      oracle_version: options?.oracleVersion || null,
+      rocky_version: options?.rockyVersion || null,
+      alma_version: options?.almaVersion || null,
     });
     return response.data;
   },
 
   // List generation jobs
-  listJobs: async (page: number = 1, pageSize: number = 10, statusFilter?: SymGenStatus): Promise<SymGenListResponse> => {
+  // statusFilter can be: 'completed', 'failed', 'in_progress', or a specific SymGenStatus
+  listJobs: async (page: number = 1, pageSize: number = 10, statusFilter?: string): Promise<SymGenListResponse> => {
     const params = new URLSearchParams({
       page: page.toString(),
       page_size: pageSize.toString(),

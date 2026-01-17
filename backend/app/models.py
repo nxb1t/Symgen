@@ -16,6 +16,12 @@ class SymGenStatus(str, enum.Enum):
 class LinuxDistro(str, enum.Enum):
     UBUNTU = "ubuntu"
     DEBIAN = "debian"
+    FEDORA = "fedora"
+    CENTOS = "centos"
+    RHEL = "rhel"
+    ORACLE = "oracle"
+    ROCKY = "rocky"
+    ALMA = "alma"
 
 
 class UbuntuVersion(str, enum.Enum):
@@ -30,6 +36,38 @@ class DebianVersion(str, enum.Enum):
     DEBIAN_12 = "12"  # Bookworm
 
 
+class FedoraVersion(str, enum.Enum):
+    FEDORA_38 = "38"
+    FEDORA_39 = "39"
+    FEDORA_40 = "40"
+
+
+class CentOSVersion(str, enum.Enum):
+    CENTOS_7 = "7"
+    CENTOS_8 = "8"  # CentOS Stream 8
+    CENTOS_9 = "9"  # CentOS Stream 9
+
+
+class RHELVersion(str, enum.Enum):
+    RHEL_8 = "8"
+    RHEL_9 = "9"
+
+
+class OracleVersion(str, enum.Enum):
+    ORACLE_8 = "8"
+    ORACLE_9 = "9"
+
+
+class RockyVersion(str, enum.Enum):
+    ROCKY_8 = "8"
+    ROCKY_9 = "9"
+
+
+class AlmaVersion(str, enum.Enum):
+    ALMA_8 = "8"
+    ALMA_9 = "9"
+
+
 class SymbolGeneration(Base):
     """Tracks Linux symbol generation jobs using Docker containers."""
     __tablename__ = "symbol_generations"
@@ -41,6 +79,13 @@ class SymbolGeneration(Base):
     distro = Column(SQLEnum(LinuxDistro, values_callable=lambda x: [e.value for e in x]), default=LinuxDistro.UBUNTU)
     ubuntu_version = Column(SQLEnum(UbuntuVersion, values_callable=lambda x: [e.value for e in x]), nullable=True)
     debian_version = Column(SQLEnum(DebianVersion, values_callable=lambda x: [e.value for e in x]), nullable=True)
+    fedora_version = Column(SQLEnum(FedoraVersion, values_callable=lambda x: [e.value for e in x]), nullable=True)
+    centos_version = Column(SQLEnum(CentOSVersion, values_callable=lambda x: [e.value for e in x]), nullable=True)
+    rhel_version = Column(SQLEnum(RHELVersion, values_callable=lambda x: [e.value for e in x]), nullable=True)
+    oracle_version = Column(SQLEnum(OracleVersion, values_callable=lambda x: [e.value for e in x]), nullable=True)
+    rocky_version = Column(SQLEnum(RockyVersion, values_callable=lambda x: [e.value for e in x]), nullable=True)
+    alma_version = Column(SQLEnum(AlmaVersion, values_callable=lambda x: [e.value for e in x]), nullable=True)
+
     # Job status
     status = Column(SQLEnum(SymGenStatus, values_callable=lambda x: [e.value for e in x]), default=SymGenStatus.PENDING)
     status_message = Column(String, nullable=True)  # Human-readable progress
